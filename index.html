@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weld Path Planner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#0e1012; --surface:#161a1d; --surface2:#1c2126; --border:#232a30;
+  --text:#cdd5de; --muted:#4e5c6a; --green:#3ddc84; --blue:#5aa8ff;
+  --orange:#f07040; --warn:#f0c040; --red:#ff5f5f; --purple:#a78bfa;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;
+  font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden;}
+
+/* ── Header ── */
+header{display:flex;align-items:center;gap:12px;padding:0 20px;height:46px;
+  background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;}
+.logo{font-size:14px;font-weight:600;letter-spacing:.02em;}
+.logo-sub{font-size:12px;color:var(--muted);font-weight:400;}
+.hdr-right{margin-left:auto;display:flex;gap:16px;align-items:center;
+  font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);}
+.sdot{display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--green);margin-right:5px;vertical-align:middle;
+  box-shadow:0 0 5px var(--green);animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── Layout ── */
+main{display:flex;flex:1;overflow:hidden;}
+aside{width:272px;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent;}
+.panel{padding:14px 16px;border-bottom:1px solid var(--border);}
+.plbl{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:11px;}
+
+/* ── Upload zone ── */
+.upload-zone{border:1px dashed var(--border);border-radius:7px;padding:20px 12px;
+  text-align:center;cursor:pointer;transition:all .15s;color:var(--muted);
+  font-size:12px;position:relative;}
+.upload-zone:hover,.upload-zone.over{border-color:var(--blue);color:var(--blue);
+  background:rgba(90,168,255,.04);}
+.upload-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;}
+.upload-zone .big{font-size:22px;margin-bottom:6px;}
+.upload-zone .hint{font-size:11px;color:var(--muted);margin-top:4px;}
+
+/* Image preview strip */
+.img-strip{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;}
+.img-thumb{width:70px;height:52px;object-fit:cover;border-radius:4px;
+  border:1px solid var(--border);flex-shrink:0;}
+.img-count{font-family:'DM Mono',monospace;font-size:11px;color:var(--blue);
+  margin-top:6px;}
+
+/* ── Run button ── */
+.run-btn{width:100%;padding:11px 14px;background:var(--orange);border:none;
+  border-radius:6px;color:#fff;font-family:'DM Sans',sans-serif;font-size:13px;
+  font-weight:600;cursor:pointer;transition:all .15s;display:flex;
+  align-items:center;justify-content:center;gap:8px;margin-top:10px;}
+.run-btn:hover{background:#d8603a;}
+.run-btn:disabled{background:#3a2a1a;color:#7a5040;cursor:not-allowed;}
+.run-btn .icon{font-size:16px;}
+
+/* ── Progress panel ── */
+.prog-wrap{display:none;}
+.prog-wrap.visible{display:block;}
+.prog-steps{margin-bottom:10px;}
+.prog-step{display:flex;align-items:center;gap:8px;padding:5px 0;
+  font-size:12px;color:var(--muted);transition:color .2s;}
+.prog-step.active{color:var(--text);}
+.prog-step.done{color:var(--green);}
+.prog-step.error{color:var(--red);}
+.step-dot{width:7px;height:7px;border-radius:50%;background:var(--border);flex-shrink:0;transition:all .2s;}
+.prog-step.active .step-dot{background:var(--orange);box-shadow:0 0 6px var(--orange);}
+.prog-step.done .step-dot{background:var(--green);}
+.prog-step.error .step-dot{background:var(--red);}
+.prog-bar{height:2px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:6px;}
+.prog-fill{height:100%;background:var(--orange);width:0%;transition:width .3s;}
+.prog-msg{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);
+  margin-top:5px;line-height:1.5;}
+
+/* ── Result card ── */
+.result-card{display:none;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;padding:10px 12px;font-family:'DM Mono',monospace;font-size:11px;
+  line-height:1.9;margin-top:10px;}
+.result-card.visible{display:block;}
+.rc-head{font-size:10px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:6px;}
+.rc-val{color:var(--text);}
+.rc-hi{color:var(--orange);font-weight:500;}
+.rc-start{color:var(--green);}
+.rc-end{color:var(--blue);}
+
+/* ── View controls ── */
+.ctrl-row{display:flex;align-items:center;gap:10px;margin-bottom:9px;}
+.ctrl-lbl{font-size:12px;color:var(--muted);width:72px;flex-shrink:0;}
+input[type=range]{flex:1;-webkit-appearance:none;height:2px;background:var(--border);
+  border-radius:2px;outline:none;}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;
+  border-radius:50%;background:var(--blue);cursor:pointer;}
+.ctrl-val{font-family:'DM Mono',monospace;font-size:11px;color:var(--blue);
+  width:30px;text-align:right;}
+
+/* ── Buttons ── */
+.btn-row{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;}
+.btn{background:none;border:1px solid var(--border);color:var(--text);
+  padding:6px 10px;font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;
+  cursor:pointer;border-radius:5px;transition:all .12s;white-space:nowrap;}
+.btn:hover{border-color:var(--muted);}
+.btn.active{background:var(--surface2);border-color:var(--blue);color:var(--blue);}
+.btn.green{border-color:#1e3d2a;color:var(--green);}
+.btn.green:hover{background:rgba(61,220,132,.08);border-color:var(--green);}
+.btn.blue{border-color:#1a2e45;color:var(--blue);}
+.btn.blue:hover{background:rgba(90,168,255,.08);border-color:var(--blue);}
+.btn.orange{background:var(--orange);border-color:var(--orange);color:#fff;font-weight:600;flex:1;}
+.btn.orange:hover{background:#d8603a;}
+.btn.ghost-red{border-color:#3a1a1a;color:var(--red);}
+.btn.ghost-red:hover{background:rgba(255,95,95,.08);border-color:var(--red);}
+
+/* ── Mode tabs ── */
+.mode-tabs{display:flex;background:var(--bg);border-radius:6px;padding:3px;margin-bottom:12px;gap:2px;}
+.mode-tab{flex:1;padding:6px 8px;border:none;background:transparent;
+  color:var(--muted);font-family:'DM Sans',sans-serif;font-size:12px;
+  font-weight:500;cursor:pointer;border-radius:4px;transition:all .15s;}
+.mode-tab.active{background:var(--surface2);color:var(--text);}
+
+/* ── Weld point rows ── */
+.weld-point{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;
+  border:1px solid var(--border);border-radius:5px;margin-bottom:6px;
+  font-family:'DM Mono',monospace;font-size:11px;transition:border-color .15s;}
+.weld-point.set{border-color:#1e3d2a;}
+.wdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:2px;}
+.wcoords{flex:1;color:var(--text);line-height:1.6;}
+.wcoords.empty{color:var(--muted);}
+.weld-clear{background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:14px;line-height:1;padding:0 2px;transition:color .1s;}
+.weld-clear:hover{color:var(--orange);}
+
+/* ── Auto detect ── */
+.detect-settings{margin-bottom:10px;}
+.detect-row{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:12px;}
+.detect-row label{color:var(--muted);flex:1;}
+.detect-row input[type=range]{width:80px;}
+.detect-row .ctrl-val{width:36px;}
+.detect-btn{width:100%;padding:9px 14px;
+  background:linear-gradient(135deg,rgba(61,220,132,.1),rgba(90,168,255,.1));
+  border:1px solid var(--border);border-radius:6px;color:var(--text);
+  font-family:'DM Sans',sans-serif;font-size:12px;font-weight:600;cursor:pointer;
+  transition:all .15s;text-align:left;margin-bottom:10px;display:flex;align-items:center;gap:10px;}
+.detect-btn:hover{border-color:var(--green);background:rgba(61,220,132,.12);}
+.detect-result{background:var(--bg);border:1px solid var(--border);border-radius:5px;
+  padding:8px 10px;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);
+  line-height:1.7;margin-bottom:8px;display:none;}
+.detect-result.visible{display:block;}
+.detect-result .hi{color:var(--text);}
+.detect-result .acc{color:var(--green);}
+
+/* ── Coord output ── */
+.coord-out{font-family:'DM Mono',monospace;font-size:11px;line-height:2;color:var(--muted);}
+.coord-out .lbl{font-weight:500;font-size:10px;letter-spacing:.06em;}
+.coord-out .val{color:var(--text);}
+.coord-out .len{color:var(--orange);font-weight:500;}
+.export-btn{margin-top:10px;width:100%;padding:7px 12px;background:none;
+  border:1px solid var(--border);border-radius:5px;color:var(--muted);
+  font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .12s;}
+.export-btn:hover{border-color:var(--blue);color:var(--blue);}
+
+/* ── Weld play ── */
+.play-bar{margin-top:8px;}
+.prog-bar2{height:2px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:8px;}
+.prog-fill2{height:100%;background:var(--orange);width:0%;transition:width .05s;}
+.prog-lbl2{font-size:11px;color:var(--muted);margin-top:5px;font-family:'DM Mono',monospace;}
+
+/* ── Canvas ── */
+.canvas-wrap{flex:1;position:relative;overflow:hidden;}
+canvas{display:block;width:100%;height:100%;}
+.canvas-wrap.pick-start{cursor:crosshair;}
+.canvas-wrap.pick-end{cursor:cell;}
+.overlay-hints{position:absolute;top:14px;left:14px;font-size:11px;color:var(--muted);
+  pointer-events:none;line-height:2;background:rgba(14,16,18,.65);
+  padding:6px 10px;border-radius:5px;}
+.overlay-hints .k{color:var(--blue);}
+.empty-state{position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;color:var(--muted);pointer-events:none;}
+.empty-icon{font-size:44px;margin-bottom:18px;opacity:.12;}
+.empty-state p{font-size:13px;}
+.empty-state .sub{font-size:11px;margin-top:6px;font-family:'DM Mono',monospace;}
+.mode-overlay{position:absolute;top:14px;right:14px;font-size:12px;font-weight:500;pointer-events:none;}
+.chH,.chV{position:absolute;pointer-events:none;opacity:0;transition:opacity .1s;}
+.chH{height:1px;left:0;right:0;background:rgba(61,220,132,.3);}
+.chV{width:1px;top:0;bottom:0;background:rgba(61,220,132,.3);}
+.chH.end,.chV.end{background:rgba(90,168,255,.3);}
+.canvas-wrap.pick-start .chH,.canvas-wrap.pick-start .chV,
+.canvas-wrap.pick-end .chH,.canvas-wrap.pick-end .chV{opacity:1;}
+
+/* ── Processing overlay on canvas ── */
+.proc-overlay{position:absolute;inset:0;background:rgba(14,16,18,.82);
+  display:none;flex-direction:column;align-items:center;justify-content:center;
+  z-index:20;gap:14px;}
+.proc-overlay.visible{display:flex;}
+.proc-spinner{width:36px;height:36px;border:3px solid var(--border);
+  border-top-color:var(--orange);border-radius:50%;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.proc-msg{font-size:13px;color:var(--text);}
+.proc-sub{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;}
+
+/* ── Stats bar ── */
+.stats-bar{background:var(--surface);border-top:1px solid var(--border);padding:5px 20px;
+  display:flex;gap:22px;flex-shrink:0;font-family:'DM Mono',monospace;font-size:11px;
+  color:var(--muted);align-items:center;}
+.stats-bar .v{color:var(--text);margin-left:4px;}
+.stats-bar .sep{color:var(--border);}
+
+/* ── Tooltip ── */
+#tooltip{position:absolute;pointer-events:none;display:none;background:var(--surface2);
+  border:1px solid var(--border);border-radius:5px;padding:6px 10px;
+  font-family:'DM Mono',monospace;font-size:11px;color:var(--text);
+  line-height:1.6;z-index:10;}
+
+/* ── Toast ── */
+#toast{position:fixed;bottom:50px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+  padding:8px 18px;font-size:12px;color:var(--text);opacity:0;pointer-events:none;
+  transition:all .25s;z-index:100;}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Weld Path Planner <span class="logo-sub">3D Reconstruction Viewer</span></div>
+  <div class="hdr-right">
+    <span><span class="sdot"></span><span id="hStatus">Ready</span></span>
+    <span id="hPts">0 pts</span>
+    <span id="hMode">View</span>
+  </div>
+</header>
+
+<main>
+<aside>
+
+  <!-- ── Upload Panel ── -->
+  <div class="panel">
+    <div class="plbl">Upload Weld Images</div>
+    <div class="upload-zone" id="dropZone">
+      <input type="file" id="fileInput" accept="image/*,.ply" multiple>
+      <div class="big">📷</div>
+      Drop 3 weld images here
+      <div class="hint">JPG / PNG &nbsp;·&nbsp; also accepts .ply directly</div>
+    </div>
+    <div class="img-strip" id="imgStrip"></div>
+    <div class="img-count" id="imgCount"></div>
+    <button class="run-btn" id="runBtn" disabled onclick="runReconstruction()">
+      <span class="icon">⚙</span> Generate 3D Reconstruction
+    </button>
+  </div>
+
+  <!-- ── Progress Panel ── -->
+  <div class="panel prog-wrap" id="progPanel">
+    <div class="plbl">Processing</div>
+    <div class="prog-steps" id="progSteps">
+      <div class="prog-step" id="ps1"><span class="step-dot"></span>Device setup</div>
+      <div class="prog-step" id="ps2"><span class="step-dot"></span>Loading VGGT-1B</div>
+      <div class="prog-step" id="ps3"><span class="step-dot"></span>Loading Metric3D</div>
+      <div class="prog-step" id="ps4"><span class="step-dot"></span>3D reconstruction</div>
+      <div class="prog-step" id="ps5"><span class="step-dot"></span>Writing .ply file</div>
+      <div class="prog-step" id="ps6"><span class="step-dot"></span>Weld seam detection</div>
+      <div class="prog-step" id="ps7"><span class="step-dot"></span>Done</div>
+    </div>
+    <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
+    <div class="prog-msg" id="progMsg">Starting…</div>
+  </div>
+
+  <!-- ── Result summary ── -->
+  <div class="panel">
+    <div class="plbl">Reconstruction Result</div>
+    <div class="result-card" id="resultCard"></div>
+    <div class="btn-row" id="dlBtns" style="display:none">
+      <button class="btn blue" onclick="downloadPLY()">↓ .ply</button>
+      <button class="btn" onclick="downloadResult()">↓ JSON</button>
+    </div>
+  </div>
+
+  <!-- ── Weld Path ── -->
+  <div class="panel">
+    <div class="plbl">Weld Path</div>
+    <div class="mode-tabs">
+      <button class="mode-tab active" id="tabManual" onclick="switchMode('manual')">Manual Pick</button>
+      <button class="mode-tab" id="tabAuto" onclick="switchMode('auto')">Auto Detect</button>
+    </div>
+
+    <!-- Manual -->
+    <div id="modeManual">
+      <div id="pickBadge" style="font-size:11px;color:var(--muted);margin-bottom:10px;">
+        Click "Set Start" then click a point on the cloud.
+      </div>
+      <div class="weld-point" id="startRow">
+        <div class="wdot" style="background:var(--green)"></div>
+        <div class="wcoords empty" id="startCoords">Start not set</div>
+        <button class="weld-clear" onclick="clearPoint('start')">&#215;</button>
+      </div>
+      <div class="weld-point" id="endRow">
+        <div class="wdot" style="background:var(--blue)"></div>
+        <div class="wcoords empty" id="endCoords">End not set</div>
+        <button class="weld-clear" onclick="clearPoint('end')">&#215;</button>
+      </div>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn green" onclick="startPicking('start')">Set Start</button>
+        <button class="btn blue"  onclick="startPicking('end')">Set End</button>
+      </div>
+      <div class="play-bar">
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn orange" id="btnPlay" onclick="togglePlay()">▶ Play Weld</button>
+          <button class="btn ghost-red" onclick="clearAllPoints()">Clear</button>
+        </div>
+        <div class="prog-bar2"><div class="prog-fill2" id="pf1"></div></div>
+        <div class="prog-lbl2" id="pl1"></div>
+      </div>
+    </div>
+
+    <!-- Auto -->
+    <div id="modeAuto" style="display:none">
+      <div class="detect-settings">
+        <div class="detect-row">
+          <label>Warm threshold</label>
+          <input type="range" id="warmThresh" min="5" max="60" value="20" step="5">
+          <div class="ctrl-val" id="warmThreshV">20</div>
+        </div>
+        <div class="detect-row">
+          <label>Min brightness</label>
+          <input type="range" id="brightMin" min="100" max="220" value="150" step="10">
+          <div class="ctrl-val" id="brightMinV">150</div>
+        </div>
+        <div class="detect-row">
+          <label>Trim outliers %</label>
+          <input type="range" id="trimPct" min="0" max="15" value="5" step="1">
+          <div class="ctrl-val" id="trimPctV">5</div>
+        </div>
+      </div>
+      <button class="detect-btn" onclick="autoDetect()">
+        <span>⚡</span><span>Run Auto-Detection</span>
+      </button>
+      <div class="detect-result" id="detectResult"></div>
+      <div class="btn-row">
+        <button class="btn orange" id="btnPlayAuto" onclick="togglePlay()" style="display:none">▶ Play Weld</button>
+      </div>
+      <div class="prog-bar2"><div class="prog-fill2" id="pf2"></div></div>
+      <div class="prog-lbl2" id="pl2"></div>
+    </div>
+  </div>
+
+  <!-- ── View controls ── -->
+  <div class="panel">
+    <div class="plbl">View</div>
+    <div class="ctrl-row">
+      <div class="ctrl-lbl">Point Size</div>
+      <input type="range" id="ptSize" min="0.5" max="5" step="0.5" value="1.5">
+      <div class="ctrl-val" id="ptSizeV">1.5</div>
+    </div>
+    <div class="ctrl-row">
+      <div class="ctrl-lbl">Opacity</div>
+      <input type="range" id="opacity" min="0.05" max="1" step="0.05" value="0.85">
+      <div class="ctrl-val" id="opacityV">0.85</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn active" id="btnAxes" onclick="toggleAxes()">Axes</button>
+      <button class="btn" onclick="resetView()">Reset</button>
+      <button class="btn" onclick="fitView()">Fit</button>
+    </div>
+  </div>
+
+  <!-- ── Coordinates ── -->
+  <div class="panel" style="flex:1">
+    <div class="plbl">Weld Coordinates</div>
+    <div class="coord-out" id="coordOutput">Set start and end points to see coordinates.</div>
+    <button class="export-btn" id="exportBtn" onclick="exportJSON()" style="display:none">
+      ↓ Export weld_path.json
+    </button>
+  </div>
+
+</aside>
+
+<!-- ── Canvas ── -->
+<div class="canvas-wrap" id="canvasWrap">
+  <canvas id="c"></canvas>
+  <div class="chH" id="chH"></div>
+  <div class="chV" id="chV"></div>
+  <div id="tooltip"></div>
+
+  <!-- Processing overlay -->
+  <div class="proc-overlay" id="procOverlay">
+    <div class="proc-spinner"></div>
+    <div class="proc-msg" id="procMsg">Running reconstruction…</div>
+    <div class="proc-sub" id="procSub">This may take a few minutes</div>
+  </div>
+
+  <div class="empty-state" id="emptyState">
+    <div class="empty-icon">⬡</div>
+    <p>Upload 3 weld images to begin</p>
+    <p class="sub">or drop a .ply file directly</p>
+  </div>
+
+  <div class="overlay-hints" id="overlayHints">
+    <div><span class="k">Drag</span> rotate &nbsp; <span class="k">Scroll</span> zoom &nbsp; <span class="k">Right drag</span> pan</div>
+    <div><span class="k">Click</span> inspect / pick point</div>
+  </div>
+  <div class="mode-overlay" id="modeOverlay"></div>
+</div>
+</main>
+
+<div class="stats-bar">
+  <div>Points <span class="v" id="sPts">--</span></div>
+  <span class="sep">|</span>
+  <div>X <span class="v" id="sX">--</span></div>
+  <div>Y <span class="v" id="sY">--</span></div>
+  <div>Z <span class="v" id="sZ">--</span></div>
+  <span class="sep">|</span>
+  <div>Hover <span class="v" id="sSel">--</span></div>
+  <span class="sep">|</span>
+  <div>Seam <span class="v" id="sLen">--</span></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+// State
+// ══════════════════════════════════════════════════════════════
+let ptsBuf = null, bounds = null, loaded = false;
+let weldStart = null, weldEnd = null;
+let pickingMode = null, currentMode = 'manual';
+let playing = false, playT = 0, playRAF = null;
+let cam = { rotX:-0.35, rotY:0.45, zoom:1, panX:0, panY:0 };
+let drag = { on:false, right:false, lx:0, ly:0 };
+let showAxes = true;
+const MAX_RENDER = 120000;
+let renderStep = 1;
+let currentJobId = null;
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const wrap   = document.getElementById('canvasWrap');
+
+// ── Uploaded image files (for reconstruction) ──
+let uploadedImages = [];
+let uploadedPly    = null;
+
+// ══════════════════════════════════════════════════════════════
+// Resize
+// ══════════════════════════════════════════════════════════════
+function resize() {
+  canvas.width  = wrap.clientWidth  * devicePixelRatio;
+  canvas.height = wrap.clientHeight * devicePixelRatio;
+  canvas.style.width  = wrap.clientWidth  + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+  draw();
+}
+window.addEventListener('resize', resize);
+
+// ══════════════════════════════════════════════════════════════
+// File input — images OR .ply
+// ══════════════════════════════════════════════════════════════
+const dz = document.getElementById('dropZone');
+document.getElementById('fileInput').addEventListener('change', e => handleFiles(e.target.files));
+document.body.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('over'); });
+document.body.addEventListener('dragleave', () => dz.classList.remove('over'));
+document.body.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('over');
+  handleFiles(e.dataTransfer.files);
+});
+
+function handleFiles(files) {
+  const plyFiles = [...files].filter(f => f.name.endsWith('.ply'));
+  const imgFiles = [...files].filter(f => f.type.startsWith('image/'));
+
+  if (plyFiles.length > 0) {
+    // Direct PLY load
+    const r = new FileReader();
+    r.onload = e => parsePLY(e.target.result);
+    r.readAsArrayBuffer(plyFiles[0]);
+    toast('Loading .ply file…');
+    return;
+  }
+
+  if (imgFiles.length > 0) {
+    uploadedImages = imgFiles;
+    uploadedPly    = null;
+    renderImagePreviews(imgFiles);
+    document.getElementById('runBtn').disabled = imgFiles.length < 2;
+    document.getElementById('imgCount').textContent =
+      imgFiles.length + ' image' + (imgFiles.length !== 1 ? 's' : '') + ' selected';
+  }
+}
+
+function renderImagePreviews(files) {
+  const strip = document.getElementById('imgStrip');
+  strip.innerHTML = '';
+  [...files].forEach(f => {
+    const img = document.createElement('img');
+    img.className = 'img-thumb';
+    img.src = URL.createObjectURL(f);
+    strip.appendChild(img);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// Run reconstruction → server
+// ══════════════════════════════════════════════════════════════
+async function runReconstruction() {
+  if (uploadedImages.length < 2) { toast('Upload at least 2 images first'); return; }
+
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('progPanel').classList.add('visible');
+  document.getElementById('procOverlay').classList.add('visible');
+  document.getElementById('procMsg').textContent = 'Sending images to server…';
+  document.getElementById('procSub').textContent = '';
+  setStatus('Processing…');
+
+  // Reset step indicators
+  for (let i = 1; i <= 7; i++) {
+    const el = document.getElementById('ps' + i);
+    el.className = 'prog-step';
+  }
+  document.getElementById('progFill').style.width = '0%';
+
+  const form = new FormData();
+  uploadedImages.forEach(f => form.append('images', f));
+
+  let jobId;
+  try {
+    const res  = await fetch('/reconstruct', { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    jobId = data.job_id;
+    currentJobId = jobId;
+  } catch (err) {
+    showError('Failed to start job: ' + err.message);
+    return;
+  }
+
+  // ── Listen to SSE progress stream ──
+  const evtSource = new EventSource('/progress/' + jobId);
+
+  evtSource.addEventListener('progress', e => {
+    const d = JSON.parse(e.data);
+    updateProgress(d.step, d.total, d.msg);
+    document.getElementById('procMsg').textContent = d.msg;
+  });
+
+  evtSource.addEventListener('done', e => {
+    evtSource.close();
+    const result = JSON.parse(e.data);
+    onReconstructionDone(jobId, result);
+  });
+
+  evtSource.addEventListener('error', e => {
+    evtSource.close();
+    let msg = 'Pipeline error';
+    try { msg = JSON.parse(e.data).message; } catch(_) {}
+    showError(msg);
+  });
+
+  evtSource.addEventListener('close', () => evtSource.close());
+}
+
+function updateProgress(step, total, msg) {
+  for (let i = 1; i <= total; i++) {
+    const el = document.getElementById('ps' + i);
+    if      (i < step)  el.className = 'prog-step done';
+    else if (i === step) el.className = 'prog-step active';
+    else                 el.className = 'prog-step';
+  }
+  const pct = Math.round((step / total) * 100);
+  document.getElementById('progFill').style.width = pct + '%';
+  document.getElementById('progMsg').textContent  = msg;
+}
+
+async function onReconstructionDone(jobId, result) {
+  // ── Fetch the PLY and load it into the viewer ──
+  document.getElementById('procMsg').textContent  = 'Loading point cloud…';
+  document.getElementById('procSub').textContent  = result.point_count.toLocaleString() + ' points';
+
+  try {
+    const plyRes = await fetch('/download/' + jobId + '/ply');
+    const buf    = await plyRes.arrayBuffer();
+    parsePLY(buf);   // loads into viewer
+  } catch (err) {
+    showError('Could not load PLY: ' + err.message);
+    return;
+  }
+
+  // ── Show result card ──
+  const sl   = result.seam_length_m;
+  const slmm = result.seam_length_mm;
+  const s    = result.weld_start;
+  const e    = result.weld_end;
+
+  document.getElementById('resultCard').classList.add('visible');
+  document.getElementById('resultCard').innerHTML =
+    `<div class="rc-head">Seam detected</div>` +
+    `Length &nbsp;<span class="rc-hi">${slmm.toFixed(1)} mm</span><br>` +
+    `Points &nbsp;<span class="rc-val">${result.point_count.toLocaleString()}</span><br>` +
+    `<br><span class="rc-start">▸ Start</span><br>` +
+    `&nbsp;x <span class="rc-val">${cm(s[0])}</span> y <span class="rc-val">${cm(s[1])}</span> z <span class="rc-val">${cm(s[2])}</span><br>` +
+    `<span class="rc-end">▸ End</span><br>` +
+    `&nbsp;x <span class="rc-val">${cm(e[0])}</span> y <span class="rc-val">${cm(e[1])}</span> z <span class="rc-val">${cm(e[2])}</span>`;
+
+  document.getElementById('dlBtns').style.display = '';
+
+  // ── Auto-set weld start/end from server result ──
+  weldStart = { x: s[0], y: s[1], z: s[2] };
+  weldEnd   = { x: e[0], y: e[1], z: e[2] };
+  setPointDisplay('start', weldStart);
+  setPointDisplay('end',   weldEnd);
+  updateWeldCoords();
+  draw();
+
+  // ── Hide overlay ──
+  document.getElementById('procOverlay').classList.remove('visible');
+  document.getElementById('runBtn').disabled = false;
+  setStatus('Done');
+  toast(`Reconstruction done — ${slmm.toFixed(1)} mm seam`);
+  updateProgress(7, 7, 'Done ✓');
+}
+
+function showError(msg) {
+  document.getElementById('procOverlay').classList.remove('visible');
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('progMsg').textContent = '⚠ ' + msg;
+  for (let i = 1; i <= 7; i++) {
+    const el = document.getElementById('ps' + i);
+    if (el.classList.contains('active')) el.className = 'prog-step error';
+  }
+  setStatus('Error');
+  toast('Error: ' + msg.slice(0, 80));
+}
+
+function downloadPLY() {
+  if (!currentJobId) return;
+  window.location = '/download/' + currentJobId + '/ply';
+}
+function downloadResult() {
+  if (!currentJobId) return;
+  window.location = '/download/' + currentJobId + '/result';
+}
+
+// ══════════════════════════════════════════════════════════════
+// PLY parser (ASCII + binary LE/BE)
+// ══════════════════════════════════════════════════════════════
+function parsePLY(buf) {
+  const peek    = new Uint8Array(buf, 0, Math.min(16384, buf.byteLength));
+  const hdrText = new TextDecoder().decode(peek);
+  const hdrEnd  = hdrText.indexOf('end_header');
+  if (hdrEnd === -1) { toast('Bad PLY file'); return; }
+
+  const hdrLines = hdrText.substring(0, hdrEnd).split('\n').map(l => l.trim()).filter(Boolean);
+  const fmtLine  = hdrLines.find(l => l.startsWith('format')) || '';
+  const isBinary = fmtLine.includes('binary');
+  const isLE     = fmtLine.includes('little');
+
+  let vCount = 0;
+  const props = [];
+  let inVert  = false;
+  for (const l of hdrLines) {
+    if      (l.startsWith('element vertex'))              { vCount = parseInt(l.split(' ')[2]); inVert = true; }
+    else if (l.startsWith('element') && !l.startsWith('element vertex')) inVert = false;
+    else if (l.startsWith('property') && inVert)          { const p = l.split(' '); props.push({ type:p[1], name:p[2] }); }
+  }
+
+  const xi  = props.findIndex(p => p.name === 'x');
+  const yi  = props.findIndex(p => p.name === 'y');
+  const zi  = props.findIndex(p => p.name === 'z');
+  const ri  = props.findIndex(p => p.name === 'red'   || p.name === 'r');
+  const gi  = props.findIndex(p => p.name === 'green' || p.name === 'g');
+  const bi2 = props.findIndex(p => p.name === 'blue'  || p.name === 'b');
+  const raw = [];
+
+  if (!isBinary) {
+    const full   = new TextDecoder().decode(buf);
+    const dStart = full.indexOf('end_header') + 'end_header'.length;
+    const lines  = full.substring(dStart).trim().split('\n');
+    for (const line of lines) {
+      const v = line.trim().split(/\s+/).map(Number);
+      if (v.length < 3) continue;
+      raw.push(v[xi]||0, v[yi]||0, v[zi]||0,
+               ri  >= 0 ? v[ri]  : 200,
+               gi  >= 0 ? v[gi]  : 200,
+               bi2 >= 0 ? v[bi2] : 200);
+    }
+  } else {
+    const tSz = {char:1,uchar:1,short:2,ushort:2,int:4,uint:4,float:4,double:8};
+    const stride = props.reduce((s, p) => s + (tSz[p.type]||4), 0);
+    const rawFull = new TextDecoder().decode(new Uint8Array(buf));
+    const hdrB   = rawFull.indexOf('end_header') + 'end_header'.length;
+    const nlSz   = new Uint8Array(buf)[hdrB] === 13 ? 2 : 1;
+    const view   = new DataView(buf, hdrB + nlSz);
+    let off2 = 0;
+    const pOff = props.map(p => { const o = off2; off2 += (tSz[p.type]||4); return o; });
+    function rv(o, type) {
+      if (o + (tSz[type]||4) > view.byteLength) return 0;
+      switch(type) {
+        case 'float':  return view.getFloat32(o, isLE);
+        case 'double': return view.getFloat64(o, isLE);
+        case 'int':    return view.getInt32(o, isLE);
+        case 'uint':   return view.getUint32(o, isLE);
+        case 'short':  return view.getInt16(o, isLE);
+        case 'ushort': return view.getUint16(o, isLE);
+        case 'uchar':  return view.getUint8(o);
+        case 'char':   return view.getInt8(o);
+        default:       return view.getFloat32(o, isLE);
+      }
+    }
+    for (let i = 0; i < vCount; i++) {
+      const base = i * stride;
+      raw.push(
+        xi  >= 0 ? rv(base+pOff[xi],  props[xi].type)  : 0,
+        yi  >= 0 ? rv(base+pOff[yi],  props[yi].type)  : 0,
+        zi  >= 0 ? rv(base+pOff[zi],  props[zi].type)  : 0,
+        ri  >= 0 ? rv(base+pOff[ri],  props[ri].type)  : 200,
+        gi  >= 0 ? rv(base+pOff[gi],  props[gi].type)  : 200,
+        bi2 >= 0 ? rv(base+pOff[bi2], props[bi2].type) : 200
+      );
+    }
+  }
+  ptsBuf = new Float32Array(raw);
+  onLoaded();
+}
+
+function onLoaded() {
+  const N = ptsBuf.length / 6;
+  let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+  for (let i = 0; i < ptsBuf.length; i += 6) {
+    const x=ptsBuf[i], y=ptsBuf[i+1], z=ptsBuf[i+2];
+    if (x===0&&y===0&&z===0) continue;
+    if(x<mnx)mnx=x; if(x>mxx)mxx=x;
+    if(y<mny)mny=y; if(y>mxy)mxy=y;
+    if(z<mnz)mnz=z; if(z>mxz)mxz=z;
+  }
+  bounds = { mnx,mny,mnz,mxx,mxy,mxz,
+    cx:(mnx+mxx)/2, cy:(mny+mxy)/2, cz:(mnz+mxz)/2,
+    scale: Math.max(mxx-mnx, mxy-mny, mxz-mnz)||1 };
+  renderStep = Math.max(1, Math.floor(N / MAX_RENDER));
+  loaded = true;
+
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('sPts').textContent = N.toLocaleString();
+  document.getElementById('hPts').textContent = N.toLocaleString() + ' pts';
+  document.getElementById('sX').textContent   = cm(mnx) + '→' + cm(mxx);
+  document.getElementById('sY').textContent   = cm(mny) + '→' + cm(mxy);
+  document.getElementById('sZ').textContent   = cm(mnz) + '→' + cm(mxz);
+  resetView();
+  draw();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Projection & Draw
+// ══════════════════════════════════════════════════════════════
+function project(x, y, z) {
+  const b = bounds;
+  const nx=(x-b.cx)/b.scale, ny=(y-b.cy)/b.scale, nz=(z-b.cz)/b.scale;
+  const cosY=Math.cos(cam.rotY), sinY=Math.sin(cam.rotY);
+  const rx=nx*cosY-nz*sinY, rz=nx*sinY+nz*cosY;
+  const cosX=Math.cos(cam.rotX), sinX=Math.sin(cam.rotX);
+  const ry=ny*cosX-rz*sinX, rz2=ny*sinX+rz*cosX;
+  const W=canvas.width, H=canvas.height;
+  const s=Math.min(W,H)*2.5*cam.zoom, d=rz2+3;
+  return { sx: W/2+cam.panX*devicePixelRatio+(rx/d)*s,
+           sy: H/2+cam.panY*devicePixelRatio-(ry/d)*s, depth:d };
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!loaded || !ptsBuf) return;
+  const ptSz  = +document.getElementById('ptSize').value * devicePixelRatio;
+  const alpha = +document.getElementById('opacity').value;
+
+  for (let i = 0; i < ptsBuf.length; i += 6 * renderStep) {
+    const x=ptsBuf[i], y=ptsBuf[i+1], z=ptsBuf[i+2];
+    if (x===0&&y===0&&z===0) continue;
+    const {sx,sy} = project(x,y,z);
+    ctx.fillStyle = `rgba(${ptsBuf[i+3]},${ptsBuf[i+4]},${ptsBuf[i+5]},${alpha})`;
+    ctx.fillRect(sx-ptSz/2, sy-ptSz/2, ptSz, ptSz);
+  }
+
+  if (showAxes && bounds) {
+    const b=bounds, o=project(b.cx,b.cy,b.cz), aL=0.4;
+    [{p:project(b.cx+b.scale*aL,b.cy,b.cz),col:'#e05050',l:'X'},
+     {p:project(b.cx,b.cy+b.scale*aL,b.cz),col:'#50c070',l:'Y'},
+     {p:project(b.cx,b.cy,b.cz+b.scale*aL),col:'#5090e0',l:'Z'}].forEach(a=>{
+      ctx.beginPath(); ctx.moveTo(o.sx,o.sy); ctx.lineTo(a.p.sx,a.p.sy);
+      ctx.strokeStyle=a.col; ctx.lineWidth=1.5*devicePixelRatio; ctx.stroke();
+      ctx.fillStyle=a.col; ctx.font=(10*devicePixelRatio)+'px DM Sans,sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.fillText(a.l, a.p.sx+4, a.p.sy);
+    });
+  }
+
+  if (weldStart) drawMarker(weldStart,'#3ddc84','S',true);
+  if (weldEnd)   drawMarker(weldEnd,  '#5aa8ff','E',false);
+
+  if (weldStart && weldEnd) {
+    const ps=project(weldStart.x,weldStart.y,weldStart.z);
+    const pe=project(weldEnd.x,  weldEnd.y,  weldEnd.z);
+    ctx.beginPath(); ctx.moveTo(ps.sx,ps.sy); ctx.lineTo(pe.sx,pe.sy);
+    ctx.strokeStyle='rgba(255,255,255,0.14)';
+    ctx.lineWidth=1.5*devicePixelRatio;
+    ctx.setLineDash([4*devicePixelRatio,4*devicePixelRatio]);
+    ctx.stroke(); ctx.setLineDash([]);
+
+    if (playing || playT > 0) {
+      const tx=weldStart.x+(weldEnd.x-weldStart.x)*playT;
+      const ty=weldStart.y+(weldEnd.y-weldStart.y)*playT;
+      const tz=weldStart.z+(weldEnd.z-weldStart.z)*playT;
+      const pp=project(tx,ty,tz);
+      ctx.beginPath(); ctx.moveTo(ps.sx,ps.sy); ctx.lineTo(pp.sx,pp.sy);
+      ctx.strokeStyle='#f07040'; ctx.lineWidth=3*devicePixelRatio; ctx.stroke();
+      const gr=ctx.createRadialGradient(pp.sx,pp.sy,0,pp.sx,pp.sy,18*devicePixelRatio);
+      gr.addColorStop(0,'rgba(255,230,80,.95)'); gr.addColorStop(.25,'rgba(255,140,40,.6)');
+      gr.addColorStop(.6,'rgba(240,80,30,.25)'); gr.addColorStop(1,'rgba(240,80,30,0)');
+      ctx.beginPath(); ctx.arc(pp.sx,pp.sy,18*devicePixelRatio,0,Math.PI*2);
+      ctx.fillStyle=gr; ctx.fill();
+      ctx.beginPath(); ctx.arc(pp.sx,pp.sy,3.5*devicePixelRatio,0,Math.PI*2);
+      ctx.fillStyle='#fff'; ctx.fill();
+    }
+  }
+}
+
+function drawMarker(pt, color, label, isCircle) {
+  const p=project(pt.x,pt.y,pt.z), r=9*devicePixelRatio;
+  ctx.beginPath();
+  if (isCircle) ctx.arc(p.sx,p.sy,r,0,Math.PI*2);
+  else          ctx.rect(p.sx-r,p.sy-r,r*2,r*2);
+  const hx=parseInt(color.slice(1),16);
+  ctx.fillStyle=`rgba(${(hx>>16)&255},${(hx>>8)&255},${hx&255},0.18)`;
+  ctx.fill();
+  ctx.strokeStyle=color; ctx.lineWidth=2*devicePixelRatio; ctx.stroke();
+  ctx.fillStyle=color;
+  ctx.font=`700 ${9*devicePixelRatio}px DM Sans,sans-serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(label, p.sx, p.sy);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Mouse
+// ══════════════════════════════════════════════════════════════
+canvas.addEventListener('mousedown', e=>{drag.on=true;drag.right=e.button===2;drag.lx=e.clientX;drag.ly=e.clientY;});
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+window.addEventListener('mouseup', ()=>drag.on=false);
+window.addEventListener('mousemove', e=>{
+  if (drag.on) {
+    const dx=e.clientX-drag.lx, dy=e.clientY-drag.ly;
+    drag.lx=e.clientX; drag.ly=e.clientY;
+    if (drag.right){cam.panX+=dx;cam.panY+=dy;} else{cam.rotY+=dx*.01;cam.rotX+=dy*.01;}
+    draw();
+  }
+  const rect=wrap.getBoundingClientRect();
+  document.getElementById('chH').style.top  = (e.clientY-rect.top)+'px';
+  document.getElementById('chV').style.left = (e.clientX-rect.left)+'px';
+});
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  cam.zoom*=e.deltaY<0?1.1:0.91;
+  cam.zoom=Math.max(.1,Math.min(20,cam.zoom));
+  draw();
+},{passive:false});
+
+canvas.addEventListener('click', e=>{
+  if (!loaded||!ptsBuf) return;
+  const rect=canvas.getBoundingClientRect();
+  const mx=(e.clientX-rect.left)*devicePixelRatio;
+  const my=(e.clientY-rect.top) *devicePixelRatio;
+  let bx=0,by=0,bz=0,minD=22*devicePixelRatio;
+  for (let i=0;i<ptsBuf.length;i+=6*renderStep){
+    const x=ptsBuf[i],y=ptsBuf[i+1],z=ptsBuf[i+2];
+    if(x===0&&y===0&&z===0)continue;
+    const{sx,sy}=project(x,y,z);
+    const d=Math.hypot(sx-mx,sy-my);
+    if(d<minD){minD=d;bx=x;by=y;bz=z;}
+  }
+  if (minD<22*devicePixelRatio){
+    const coord={x:bx,y:by,z:bz};
+    if      (pickingMode==='start'){weldStart=coord;setPointDisplay('start',coord);pickingMode='end';updatePickingUI();toast('Start set — now pick end');}
+    else if (pickingMode==='end')  {weldEnd=coord;setPointDisplay('end',coord);pickingMode=null;updatePickingUI();updateWeldCoords();wrap.classList.remove('pick-start','pick-end');toast('End set ✓');}
+    else document.getElementById('sSel').textContent=cm(bx)+'  '+cm(by)+'  '+cm(bz);
+    draw();
+  }
+});
+
+let hRAF=null;
+canvas.addEventListener('mousemove', e=>{
+  if (!loaded||!ptsBuf||pickingMode) return;
+  if (hRAF) cancelAnimationFrame(hRAF);
+  hRAF=requestAnimationFrame(()=>{
+    const rect=canvas.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*devicePixelRatio;
+    const my=(e.clientY-rect.top) *devicePixelRatio;
+    let bx=0,by=0,bz=0,minD=14*devicePixelRatio;
+    for(let i=0;i<ptsBuf.length;i+=6*Math.max(renderStep,3)){
+      const x=ptsBuf[i],y=ptsBuf[i+1],z=ptsBuf[i+2];
+      if(x===0&&y===0&&z===0)continue;
+      const{sx,sy}=project(x,y,z);
+      const d=Math.hypot(sx-mx,sy-my);
+      if(d<minD){minD=d;bx=x;by=y;bz=z;}
+    }
+    const tip=document.getElementById('tooltip');
+    if (minD<14*devicePixelRatio){
+      tip.style.display='block';
+      tip.style.left=(e.clientX-wrap.getBoundingClientRect().left+14)+'px';
+      tip.style.top =(e.clientY-wrap.getBoundingClientRect().top -10)+'px';
+      tip.innerHTML=`x:<span style="color:var(--text)">${cm(bx)}</span><br>y:<span style="color:var(--text)">${cm(by)}</span><br>z:<span style="color:var(--text)">${cm(bz)}</span>`;
+      document.getElementById('sSel').textContent=cm(bx)+'  '+cm(by)+'  '+cm(bz);
+    } else tip.style.display='none';
+  });
+});
+canvas.addEventListener('mouseleave',()=>document.getElementById('tooltip').style.display='none');
+
+// ══════════════════════════════════════════════════════════════
+// Mode switching
+// ══════════════════════════════════════════════════════════════
+function switchMode(mode) {
+  currentMode=mode;
+  document.getElementById('tabManual').classList.toggle('active',mode==='manual');
+  document.getElementById('tabAuto').classList.toggle('active',  mode==='auto');
+  document.getElementById('modeManual').style.display=mode==='manual'?'':'none';
+  document.getElementById('modeAuto').style.display  =mode==='auto'  ?'':'none';
+  if (mode==='manual'){pickingMode=null;updatePickingUI();}
+}
+
+// ══════════════════════════════════════════════════════════════
+// Manual picking
+// ══════════════════════════════════════════════════════════════
+function startPicking(which) {
+  pickingMode=which; updatePickingUI();
+  wrap.classList.remove('pick-start','pick-end');
+  wrap.classList.add('pick-'+which); draw();
+}
+function updatePickingUI(){
+  const badge=document.getElementById('pickBadge');
+  const overlay=document.getElementById('modeOverlay');
+  const hMode=document.getElementById('hMode');
+  const chH=document.getElementById('chH'), chV=document.getElementById('chV');
+  if (pickingMode==='start'){
+    badge.textContent='🟢 Click a point — set START'; badge.style.color='var(--green)';
+    overlay.innerHTML='<span style="color:var(--green);font-size:12px;background:rgba(0,0,0,.6);padding:4px 12px;border-radius:4px">Picking start</span>';
+    hMode.textContent='Pick Start'; chH.className='chH'; chV.className='chV';
+  } else if (pickingMode==='end'){
+    badge.textContent='🔵 Click a point — set END'; badge.style.color='var(--blue)';
+    overlay.innerHTML='<span style="color:var(--blue);font-size:12px;background:rgba(0,0,0,.6);padding:4px 12px;border-radius:4px">Picking end</span>';
+    hMode.textContent='Pick End'; chH.className='chH end'; chV.className='chV end';
+  } else {
+    badge.textContent='Click "Set Start" then click a point on the cloud.'; badge.style.color='var(--muted)';
+    overlay.innerHTML=''; hMode.textContent='View';
+    wrap.classList.remove('pick-start','pick-end');
+  }
+}
+function setPointDisplay(which,coord){
+  const el=document.getElementById(which+'Coords');
+  const row=document.getElementById(which+'Row');
+  el.innerHTML=`x <b>${cm(coord.x)}</b><br>y <b>${cm(coord.y)}</b><br>z <b>${cm(coord.z)}</b>`;
+  el.classList.remove('empty'); row.classList.add('set');
+}
+function clearPoint(which){
+  if(which==='start')weldStart=null;else weldEnd=null;
+  const el=document.getElementById(which+'Coords');
+  const row=document.getElementById(which+'Row');
+  el.textContent=(which==='start'?'Start':'End')+' not set';
+  el.classList.add('empty'); row.classList.remove('set');
+  updateWeldCoords(); draw();
+}
+function clearAllPoints(){
+  weldStart=null;weldEnd=null;stopPlay();playT=0;
+  ['start','end'].forEach(w=>{
+    document.getElementById(w+'Coords').textContent=(w==='start'?'Start':'End')+' not set';
+    document.getElementById(w+'Coords').classList.add('empty');
+    document.getElementById(w+'Row').classList.remove('set');
+  });
+  ['pf1','pf2'].forEach(id=>document.getElementById(id).style.width='0%');
+  ['pl1','pl2'].forEach(id=>document.getElementById(id).textContent='');
+  document.getElementById('sLen').textContent='--';
+  document.getElementById('coordOutput').textContent='Set start and end points to see coordinates.';
+  document.getElementById('exportBtn').style.display='none';
+  document.getElementById('detectResult').classList.remove('visible');
+  document.getElementById('btnPlayAuto').style.display='none';
+  draw();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Auto-detect (browser-side PCA on PLY color)
+// ══════════════════════════════════════════════════════════════
+function autoDetect(){
+  if (!loaded||!ptsBuf){toast('Load a .ply file first');return;}
+  const warmThresh=+document.getElementById('warmThresh').value;
+  const brightMin =+document.getElementById('brightMin').value;
+  const trimPct   =+document.getElementById('trimPct').value/100;
+
+  const cands=[];
+  for(let i=0;i<ptsBuf.length;i+=6){
+    const x=ptsBuf[i],y=ptsBuf[i+1],z=ptsBuf[i+2];
+    if(x===0&&y===0&&z===0)continue;
+    const r=ptsBuf[i+3],g=ptsBuf[i+4],b=ptsBuf[i+5];
+    if(r>b+warmThresh&&(r+g+b)/3>=brightMin) cands.push({x,y,z});
+  }
+  if(cands.length<10){toast('Not enough warm points — lower thresholds');return;}
+
+  const cx=cands.reduce((s,p)=>s+p.x,0)/cands.length;
+  const cy=cands.reduce((s,p)=>s+p.y,0)/cands.length;
+  const cz=cands.reduce((s,p)=>s+p.z,0)/cands.length;
+
+  let cxx=0,cxy=0,cxz=0,cyy=0,cyz=0,czz=0;
+  for(const p of cands){const dx=p.x-cx,dy=p.y-cy,dz=p.z-cz;cxx+=dx*dx;cxy+=dx*dy;cxz+=dx*dz;cyy+=dy*dy;cyz+=dy*dz;czz+=dz*dz;}
+  const n=cands.length;cxx/=n;cxy/=n;cxz/=n;cyy/=n;cyz/=n;czz/=n;
+
+  let ax=1,ay=0,az=0;
+  for(let it=0;it<50;it++){
+    const bx=cxx*ax+cxy*ay+cxz*az, by=cxy*ax+cyy*ay+cyz*az, bz=cxz*ax+cyz*ay+czz*az;
+    const len=Math.sqrt(bx*bx+by*by+bz*bz);
+    if(!len)break; ax=bx/len;ay=by/len;az=bz/len;
+  }
+
+  const projs=cands.map(p=>({p,t:(p.x-cx)*ax+(p.y-cy)*ay+(p.z-cz)*az}));
+  projs.sort((a,b)=>a.t-b.t);
+  const trim=Math.floor(projs.length*trimPct);
+  const trimmed=projs.slice(trim,projs.length-trim);
+  if(trimmed.length<4){toast('Too few points after trim');return;}
+
+  const sp=trimmed[0].p, ep=trimmed[trimmed.length-1].p;
+  const dx=ep.x-sp.x,dy=ep.y-sp.y,dz=ep.z-sp.z;
+  const seamLen=Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const totalVar=cxx+cyy+czz;
+  const eigenVal=cxx*ax*ax+cyy*ay*ay+czz*az*az+2*(cxy*ax*ay+cxz*ax*az+cyz*ay*az);
+  const lin=totalVar>0?(eigenVal/totalVar*100).toFixed(0):0;
+
+  weldStart={x:sp.x,y:sp.y,z:sp.z};
+  weldEnd  ={x:ep.x,y:ep.y,z:ep.z};
+  setPointDisplay('start',weldStart);
+  setPointDisplay('end',  weldEnd);
+  updateWeldCoords(); draw();
+
+  const res=document.getElementById('detectResult');
+  res.classList.add('visible');
+  res.innerHTML=
+    `<span style="color:var(--green)">✓</span> <span class="hi">${cands.length.toLocaleString()}</span> seam pts &nbsp; Linearity <span class="acc">${lin}%</span><br>`+
+    `Length <span class="hi">${(seamLen*1000).toFixed(1)} mm</span><br>`+
+    `Start ${cm(sp.x)} ${cm(sp.y)} ${cm(sp.z)}<br>`+
+    `End &nbsp; ${cm(ep.x)} ${cm(ep.y)} ${cm(ep.z)}`;
+  document.getElementById('btnPlayAuto').style.display='';
+  toast(`Seam detected: ${(seamLen*1000).toFixed(1)} mm, ${lin}% linear`);
+}
+['warmThresh','brightMin','trimPct'].forEach(id=>{
+  document.getElementById(id).addEventListener('input',e=>document.getElementById(id+'V').textContent=e.target.value);
+});
+
+// ══════════════════════════════════════════════════════════════
+// Coord output + export
+// ══════════════════════════════════════════════════════════════
+function updateWeldCoords(){
+  if(!weldStart||!weldEnd)return;
+  const dx=weldEnd.x-weldStart.x, dy=weldEnd.y-weldStart.y, dz=weldEnd.z-weldStart.z;
+  const len=Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const nx=dx/len, ny=dy/len, nz=dz/len;
+  document.getElementById('sLen').textContent=(len*1000).toFixed(1)+' mm';
+  document.getElementById('coordOutput').innerHTML=
+    `<span class="lbl" style="color:var(--green)">START</span><br>`+
+    `x: <span class="val">${cm(weldStart.x)}</span><br>`+
+    `y: <span class="val">${cm(weldStart.y)}</span><br>`+
+    `z: <span class="val">${cm(weldStart.z)}</span><br><br>`+
+    `<span class="lbl" style="color:var(--blue)">END</span><br>`+
+    `x: <span class="val">${cm(weldEnd.x)}</span><br>`+
+    `y: <span class="val">${cm(weldEnd.y)}</span><br>`+
+    `z: <span class="val">${cm(weldEnd.z)}</span><br><br>`+
+    `<span class="lbl" style="color:var(--warn)">DIRECTION</span><br>`+
+    `x: <span class="val">${nx.toFixed(4)}</span><br>`+
+    `y: <span class="val">${ny.toFixed(4)}</span><br>`+
+    `z: <span class="val">${nz.toFixed(4)}</span><br><br>`+
+    `<span class="lbl">LENGTH</span> <span class="len">${(len*1000).toFixed(2)} mm</span>`;
+  document.getElementById('exportBtn').style.display='';
+}
+
+function exportJSON(){
+  if(!weldStart||!weldEnd)return;
+  const dx=weldEnd.x-weldStart.x, dy=weldEnd.y-weldStart.y, dz=weldEnd.z-weldStart.z;
+  const len=Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const data={weld_path:{
+    start:{x:weldStart.x,y:weldStart.y,z:weldStart.z},
+    end:{x:weldEnd.x,y:weldEnd.y,z:weldEnd.z},
+    direction:{x:dx/len,y:dy/len,z:dz/len},
+    length_m:+len.toFixed(6), length_mm:+(len*1000).toFixed(3),
+    units:'meters'
+  }, meta:{exported_at:new Date().toISOString(),source:'weld_path_planner'}};
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+  a.download='weld_path.json'; a.click();
+  toast('Exported weld_path.json');
+}
+
+// ══════════════════════════════════════════════════════════════
+// Play animation
+// ══════════════════════════════════════════════════════════════
+function togglePlay(){
+  if(!weldStart||!weldEnd){toast('Set start and end first');return;}
+  if(playing){stopPlay();return;}
+  playing=true; if(playT>=1)playT=0;
+  ['btnPlay','btnPlayAuto'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='⏹ Stop';});
+  animPlay();
+}
+function stopPlay(){
+  playing=false; if(playRAF)cancelAnimationFrame(playRAF);
+  ['btnPlay','btnPlayAuto'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='▶ Play Weld';});
+}
+function animPlay(){
+  if(!playing)return;
+  playT=Math.min(playT+.005,1);
+  const pct=Math.round(playT*100);
+  ['pf1','pf2'].forEach(id=>document.getElementById(id).style.width=pct+'%');
+  ['pl1','pl2'].forEach(id=>document.getElementById(id).textContent=pct+'% complete');
+  draw();
+  if(playT<1)playRAF=requestAnimationFrame(animPlay);
+  else{
+    playing=false;
+    ['btnPlay','btnPlayAuto'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='▶ Play Weld';});
+    ['pl1','pl2'].forEach(id=>document.getElementById(id).textContent='Complete ✓');
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// View controls
+// ══════════════════════════════════════════════════════════════
+function toggleAxes(){showAxes=!showAxes;document.getElementById('btnAxes').classList.toggle('active',showAxes);draw();}
+function resetView(){cam={rotX:-.35,rotY:.45,zoom:1,panX:0,panY:0};draw();}
+function fitView(){cam.zoom=1;cam.panX=0;cam.panY=0;cam.rotX=-.35;cam.rotY=.45;draw();}
+document.getElementById('ptSize').addEventListener('input',e=>{document.getElementById('ptSizeV').textContent=e.target.value;draw();});
+document.getElementById('opacity').addEventListener('input',e=>{document.getElementById('opacityV').textContent=e.target.value;draw();});
+
+// ══════════════════════════════════════════════════════════════
+// Helpers
+// ══════════════════════════════════════════════════════════════
+function cm(m)  { return (m*100).toFixed(2)+'cm'; }
+function setStatus(s){ document.getElementById('hStatus').textContent=s; }
+let toastTO;
+function toast(msg){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.classList.add('show');
+  clearTimeout(toastTO); toastTO=setTimeout(()=>el.classList.remove('show'),3200);
+}
+
+resize();
+</script>
+</body>
+</html>

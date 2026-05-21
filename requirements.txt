@@ -1,0 +1,18 @@
+# PyTorch — install CPU version first (works everywhere)
+# For NVIDIA GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+
+# Core ML
+numpy
+matplotlib
+opencv-contrib-python
+Pillow
+huggingface_hub
+safetensors
+einops
+timm
+
+# Web server
+flask
+flask-cors
