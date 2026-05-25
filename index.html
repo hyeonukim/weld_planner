@@ -378,6 +378,44 @@ canvas{display:block;width:100%;height:100%;}
     <button class="export-btn" id="exportBtn" onclick="exportJSON()" style="display:none">
       ↓ Export weld_path.json
     </button>
+    <button class="export-btn" id="rosBtn" onclick="sendToRobot(false)"
+            style="display:none;margin-top:6px;border-color:var(--orange);color:var(--orange)">
+      ⬡ Dry-run (ROS2)
+    </button>
+    <button class="export-btn" id="rosBtnArmed" onclick="sendToRobot(true)"
+            style="display:none;margin-top:4px;border-color:var(--red,#ff5f5f);color:var(--red,#ff5f5f)">
+      ⚡ SEND TO ROBOT (live weld)
+    </button>
+    <div id="rosStatus" style="display:none;margin-top:6px;font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);line-height:1.6"></div>
+  </div>
+
+  <!-- Camera Intrinsics -->
+  <div class="panel">
+    <div class="plbl">Camera Intrinsics <span style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">— optional</span></div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+      Leave blank for 70° HFOV estimate. Enter your phone focal length for better accuracy.
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:3px">fx (px)</div>
+        <input id="inFx" type="number" placeholder="e.g. 3200" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:3px">fy (px)</div>
+        <input id="inFy" type="number" placeholder="e.g. 3200" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:3px">cx (px)</div>
+        <input id="inCx" type="number" placeholder="e.g. 2016" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:3px">cy (px)</div>
+        <input id="inCy" type="number" placeholder="e.g. 1512" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">
+      Tip: run <code style="font-family:'DM Mono',monospace">exiftool image.jpg | grep Focal</code>
+    </div>
   </div>
 
 </aside>
@@ -432,12 +470,18 @@ let ptsBuf = null, bounds = null, loaded = false;
 let weldStart = null, weldEnd = null;
 let pickingMode = null, currentMode = 'manual';
 let playing = false, playT = 0, playRAF = null;
-let cam = { rotX:-0.35, rotY:0.45, zoom:1, panX:0, panY:0 };
+let cam = { rotX:-0.55, rotY:0.0, zoom:1, panX:0, panY:0 };
 let drag = { on:false, right:false, lx:0, ly:0 };
 let showAxes = true;
 const MAX_RENDER = 120000;
 let renderStep = 1;
 let currentJobId = null;
+// `weldStart` / `weldEnd` always live in CLOUD frame (raw VGGT units, Y-flipped
+// to match how the cloud is rendered). To export or display in real-world axes,
+// negate Y (un-flip) and multiply by `currentScale`.
+let currentScale  = 1.0;   // metres per VGGT unit, 1.0 if scale unknown
+let currentScaleSource = null;  // 'holes' | 'metric3d' | null
+let currentResult = null;       // last server response; carries table_frame for the gizmo
 
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
@@ -528,6 +572,15 @@ async function runReconstruction() {
   const form = new FormData();
   uploadedImages.forEach(f => form.append('images', f));
 
+  // Attach camera intrinsics if the user filled them in
+  const fx = document.getElementById('inFx').value.trim();
+  const fy = document.getElementById('inFy').value.trim();
+  const cx = document.getElementById('inCx').value.trim();
+  const cy = document.getElementById('inCy').value.trim();
+  if (fx && fy && cx && cy) {
+    form.append('intrinsics', JSON.stringify({fx:+fx, fy:+fy, cx:+cx, cy:+cy}));
+  }
+
   let jobId;
   try {
     const res  = await fetch('/reconstruct', { method: 'POST', body: form });
@@ -591,27 +644,41 @@ async function onReconstructionDone(jobId, result) {
     return;
   }
 
+  // ── Capture scale so display + export can convert VGGT units → metres ──
+  currentScale       = result.scale_factor || 1.0;
+  currentScaleSource = result.scale_source || null;
+  currentResult      = result;     // table_frame consumed by draw() gizmo
+
   // ── Show result card ──
-  const sl   = result.seam_length_m;
+  // The server's weld_start_m is in metres (world axes, no Y-flip).
+  // Fall back to weld_start (VGGT units) if no scale was recovered.
   const slmm = result.seam_length_mm;
-  const s    = result.weld_start;
-  const e    = result.weld_end;
+  const sm   = result.weld_start_m || result.weld_start;
+  const em   = result.weld_end_m   || result.weld_end;
+  const unit = result.scale_factor ? 'mm' : 'units';
+  const fmtCoord = result.scale_factor
+    ? v => (v * 100).toFixed(2) + 'cm'
+    : v => v.toFixed(4) + 'u';
 
   document.getElementById('resultCard').classList.add('visible');
   document.getElementById('resultCard').innerHTML =
     `<div class="rc-head">Seam detected</div>` +
-    `Length &nbsp;<span class="rc-hi">${slmm.toFixed(1)} mm</span><br>` +
+    `Length &nbsp;<span class="rc-hi">${slmm.toFixed(1)} ${unit}</span>` +
+    (currentScaleSource ? ` <span style="color:var(--muted);font-size:10px">(scale: ${currentScaleSource})</span>` : '') + `<br>` +
     `Points &nbsp;<span class="rc-val">${result.point_count.toLocaleString()}</span><br>` +
     `<br><span class="rc-start">▸ Start</span><br>` +
-    `&nbsp;x <span class="rc-val">${cm(s[0])}</span> y <span class="rc-val">${cm(s[1])}</span> z <span class="rc-val">${cm(s[2])}</span><br>` +
+    `&nbsp;x <span class="rc-val">${fmtCoord(sm[0])}</span> y <span class="rc-val">${fmtCoord(sm[1])}</span> z <span class="rc-val">${fmtCoord(sm[2])}</span><br>` +
     `<span class="rc-end">▸ End</span><br>` +
-    `&nbsp;x <span class="rc-val">${cm(e[0])}</span> y <span class="rc-val">${cm(e[1])}</span> z <span class="rc-val">${cm(e[2])}</span>`;
+    `&nbsp;x <span class="rc-val">${fmtCoord(em[0])}</span> y <span class="rc-val">${fmtCoord(em[1])}</span> z <span class="rc-val">${fmtCoord(em[2])}</span>`;
 
   document.getElementById('dlBtns').style.display = '';
 
   // ── Auto-set weld start/end from server result ──
-  weldStart = { x: s[0], y: s[1], z: s[2] };
-  weldEnd   = { x: e[0], y: e[1], z: e[2] };
+  // weld_start is in CLOUD frame (VGGT units, world axes — Y NOT flipped).
+  // The cloud was Y-flipped on load, so flip the markers' Y to match.
+  const s = result.weld_start, e = result.weld_end;
+  weldStart = { x: s[0], y: -s[1], z: s[2] };
+  weldEnd   = { x: e[0], y: -e[1], z: e[2] };
   setPointDisplay('start', weldStart);
   setPointDisplay('end',   weldEnd);
   updateWeldCoords();
@@ -692,9 +759,19 @@ function parsePLY(buf) {
   } else {
     const tSz = {char:1,uchar:1,short:2,ushort:2,int:4,uint:4,float:4,double:8};
     const stride = props.reduce((s, p) => s + (tSz[p.type]||4), 0);
-    const rawFull = new TextDecoder().decode(new Uint8Array(buf));
-    const hdrB   = rawFull.indexOf('end_header') + 'end_header'.length;
-    const nlSz   = new Uint8Array(buf)[hdrB] === 13 ? 2 : 1;
+    // Header is ASCII; scan the raw bytes (avoids decoding binary float data).
+    const bytes = new Uint8Array(buf);
+    const needle = [101,110,100,95,104,101,97,100,101,114]; // 'end_header'
+    let hdrB = -1;
+    outer: for (let i = 0; i < bytes.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (bytes[i+j] !== needle[j]) continue outer;
+      }
+      hdrB = i + needle.length;
+      break;
+    }
+    if (hdrB === -1) { toast('Bad PLY (no end_header)'); return; }
+    const nlSz   = bytes[hdrB] === 13 ? 2 : 1;
     const view   = new DataView(buf, hdrB + nlSz);
     let off2 = 0;
     const pOff = props.map(p => { const o = off2; off2 += (tSz[p.type]||4); return o; });
@@ -712,17 +789,19 @@ function parsePLY(buf) {
         default:       return view.getFloat32(o, isLE);
       }
     }
+    // Preallocate the output instead of growing a JS array via push.
+    ptsBuf = new Float32Array(vCount * 6);
     for (let i = 0; i < vCount; i++) {
-      const base = i * stride;
-      raw.push(
-        xi  >= 0 ? rv(base+pOff[xi],  props[xi].type)  : 0,
-        yi  >= 0 ? rv(base+pOff[yi],  props[yi].type)  : 0,
-        zi  >= 0 ? rv(base+pOff[zi],  props[zi].type)  : 0,
-        ri  >= 0 ? rv(base+pOff[ri],  props[ri].type)  : 200,
-        gi  >= 0 ? rv(base+pOff[gi],  props[gi].type)  : 200,
-        bi2 >= 0 ? rv(base+pOff[bi2], props[bi2].type) : 200
-      );
+      const base = i * stride, j = i * 6;
+      ptsBuf[j  ] = xi  >= 0 ? rv(base+pOff[xi],  props[xi].type)  : 0;
+      ptsBuf[j+1] = yi  >= 0 ? rv(base+pOff[yi],  props[yi].type)  : 0;
+      ptsBuf[j+2] = zi  >= 0 ? rv(base+pOff[zi],  props[zi].type)  : 0;
+      ptsBuf[j+3] = ri  >= 0 ? rv(base+pOff[ri],  props[ri].type)  : 200;
+      ptsBuf[j+4] = gi  >= 0 ? rv(base+pOff[gi],  props[gi].type)  : 200;
+      ptsBuf[j+5] = bi2 >= 0 ? rv(base+pOff[bi2], props[bi2].type) : 200;
     }
+    onLoaded();
+    return;
   }
   ptsBuf = new Float32Array(raw);
   onLoaded();
@@ -730,6 +809,13 @@ function parsePLY(buf) {
 
 function onLoaded() {
   const N = ptsBuf.length / 6;
+
+  // VGGT outputs Y-down (camera convention). Flip Y so the cloud
+  // shows right-side-up with the default camera angle.
+  for (let i = 1; i < ptsBuf.length; i += 6) {
+    ptsBuf[i] = -ptsBuf[i];
+  }
+
   let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
   for (let i = 0; i < ptsBuf.length; i += 6) {
     const x=ptsBuf[i], y=ptsBuf[i+1], z=ptsBuf[i+2];
@@ -747,9 +833,13 @@ function onLoaded() {
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('sPts').textContent = N.toLocaleString();
   document.getElementById('hPts').textContent = N.toLocaleString() + ' pts';
-  document.getElementById('sX').textContent   = cm(mnx) + '→' + cm(mxx);
-  document.getElementById('sY').textContent   = cm(mny) + '→' + cm(mxy);
-  document.getElementById('sZ').textContent   = cm(mnz) + '→' + cm(mxz);
+  // World-axes display: un-flip Y, apply scale (scale=1 if no calibration yet).
+  // Note: bounds are taken from already-Y-flipped ptsBuf, so multiplying y by
+  // -currentScale un-flips back to world axes.
+  const sb = v => fmtAxis(v * currentScale);
+  document.getElementById('sX').textContent   = sb(mnx) + '→' + sb(mxx);
+  document.getElementById('sY').textContent   = sb(-mxy) + '→' + sb(-mny);   // un-flip Y range
+  document.getElementById('sZ').textContent   = sb(mnz) + '→' + sb(mxz);
   resetView();
   draw();
 }
@@ -785,15 +875,47 @@ function draw() {
   }
 
   if (showAxes && bounds) {
-    const b=bounds, o=project(b.cx,b.cy,b.cz), aL=0.4;
-    [{p:project(b.cx+b.scale*aL,b.cy,b.cz),col:'#e05050',l:'X'},
-     {p:project(b.cx,b.cy+b.scale*aL,b.cz),col:'#50c070',l:'Y'},
-     {p:project(b.cx,b.cy,b.cz+b.scale*aL),col:'#5090e0',l:'Z'}].forEach(a=>{
-      ctx.beginPath(); ctx.moveTo(o.sx,o.sy); ctx.lineTo(a.p.sx,a.p.sy);
-      ctx.strokeStyle=a.col; ctx.lineWidth=1.5*devicePixelRatio; ctx.stroke();
-      ctx.fillStyle=a.col; ctx.font=(10*devicePixelRatio)+'px DM Sans,sans-serif';
-      ctx.textAlign='left'; ctx.textBaseline='middle';
-      ctx.fillText(a.l, a.p.sx+4, a.p.sy);
+    const b = bounds;
+    const aLen = b.scale * 0.3;        // axis length in VGGT cloud units
+    const tf   = currentResult && currentResult.table_frame;
+
+    let origin, axes;
+    if (tf && currentScale !== 1.0) {
+      // ── Table frame from detected hole grid ──
+      // origin_m is in metres (world axes); divide by scale to enter VGGT
+      // cloud units, then negate Y to match the cloud's display Y-flip.
+      const oWX = tf.origin_m[0] / currentScale;
+      const oWY = tf.origin_m[1] / currentScale;
+      const oWZ = tf.origin_m[2] / currentScale;
+      origin = { x: oWX, y: -oWY, z: oWZ };
+      // Each axis is a unit vector in world frame; Y-flip for cloud frame.
+      const flipY = a => [a[0], -a[1], a[2]];
+      axes = [
+        { dir: flipY(tf.x_axis), col: '#e05050', l: 'X (hole-row)' },
+        { dir: flipY(tf.y_axis), col: '#50c070', l: 'Y (hole-col)' },
+        { dir: flipY(tf.z_axis), col: '#5090e0', l: 'Z (table ↑)'  },
+      ];
+    } else {
+      // ── Fallback: VGGT world axes drawn from cloud-bounds centre ──
+      origin = { x: b.cx, y: b.cy, z: b.cz };
+      axes = [
+        { dir: [1,0,0], col: '#e05050', l: 'X' },
+        { dir: [0,1,0], col: '#50c070', l: 'Y' },
+        { dir: [0,0,1], col: '#5090e0', l: 'Z' },
+      ];
+    }
+
+    const o = project(origin.x, origin.y, origin.z);
+    axes.forEach(a => {
+      const tip = project(
+        origin.x + a.dir[0] * aLen,
+        origin.y + a.dir[1] * aLen,
+        origin.z + a.dir[2] * aLen);
+      ctx.beginPath(); ctx.moveTo(o.sx, o.sy); ctx.lineTo(tip.sx, tip.sy);
+      ctx.strokeStyle = a.col; ctx.lineWidth = 1.5*devicePixelRatio; ctx.stroke();
+      ctx.fillStyle = a.col; ctx.font = (10*devicePixelRatio)+'px DM Sans,sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(a.l, tip.sx+4, tip.sy);
     });
   }
 
@@ -852,7 +974,15 @@ window.addEventListener('mousemove', e=>{
   if (drag.on) {
     const dx=e.clientX-drag.lx, dy=e.clientY-drag.ly;
     drag.lx=e.clientX; drag.ly=e.clientY;
-    if (drag.right){cam.panX+=dx;cam.panY+=dy;} else{cam.rotY+=dx*.01;cam.rotX+=dy*.01;}
+    if (drag.right){cam.panX+=dx;cam.panY+=dy;} else{
+      cam.rotY += dx * 0.008;
+      cam.rotX += dy * 0.008;
+      // Clamp elevation so the camera never flips upside-down — past ±90°
+      // the horizontal drag direction silently inverts, which feels broken.
+      const lim = Math.PI/2 - 0.02;
+      if (cam.rotX >  lim) cam.rotX =  lim;
+      if (cam.rotX < -lim) cam.rotX = -lim;
+    }
     draw();
   }
   const rect=wrap.getBoundingClientRect();
@@ -883,7 +1013,7 @@ canvas.addEventListener('click', e=>{
     const coord={x:bx,y:by,z:bz};
     if      (pickingMode==='start'){weldStart=coord;setPointDisplay('start',coord);pickingMode='end';updatePickingUI();toast('Start set — now pick end');}
     else if (pickingMode==='end')  {weldEnd=coord;setPointDisplay('end',coord);pickingMode=null;updatePickingUI();updateWeldCoords();wrap.classList.remove('pick-start','pick-end');toast('End set ✓');}
-    else document.getElementById('sSel').textContent=cm(bx)+'  '+cm(by)+'  '+cm(bz);
+    else { const w=markerToWorld({x:bx,y:by,z:bz}); document.getElementById('sSel').textContent=fmtAxis(w[0])+'  '+fmtAxis(w[1])+'  '+fmtAxis(w[2]); }
     draw();
   }
 });
@@ -909,8 +1039,9 @@ canvas.addEventListener('mousemove', e=>{
       tip.style.display='block';
       tip.style.left=(e.clientX-wrap.getBoundingClientRect().left+14)+'px';
       tip.style.top =(e.clientY-wrap.getBoundingClientRect().top -10)+'px';
-      tip.innerHTML=`x:<span style="color:var(--text)">${cm(bx)}</span><br>y:<span style="color:var(--text)">${cm(by)}</span><br>z:<span style="color:var(--text)">${cm(bz)}</span>`;
-      document.getElementById('sSel').textContent=cm(bx)+'  '+cm(by)+'  '+cm(bz);
+      const w = markerToWorld({x:bx, y:by, z:bz});
+      tip.innerHTML=`x:<span style="color:var(--text)">${fmtAxis(w[0])}</span><br>y:<span style="color:var(--text)">${fmtAxis(w[1])}</span><br>z:<span style="color:var(--text)">${fmtAxis(w[2])}</span>`;
+      document.getElementById('sSel').textContent=fmtAxis(w[0])+'  '+fmtAxis(w[1])+'  '+fmtAxis(w[2]);
     } else tip.style.display='none';
   });
 });
@@ -958,7 +1089,8 @@ function updatePickingUI(){
 function setPointDisplay(which,coord){
   const el=document.getElementById(which+'Coords');
   const row=document.getElementById(which+'Row');
-  el.innerHTML=`x <b>${cm(coord.x)}</b><br>y <b>${cm(coord.y)}</b><br>z <b>${cm(coord.z)}</b>`;
+  const w = markerToWorld(coord);
+  el.innerHTML=`x <b>${fmtAxis(w[0])}</b><br>y <b>${fmtAxis(w[1])}</b><br>z <b>${fmtAxis(w[2])}</b>`;
   el.classList.remove('empty'); row.classList.add('set');
 }
 function clearPoint(which){
@@ -981,6 +1113,9 @@ function clearAllPoints(){
   document.getElementById('sLen').textContent='--';
   document.getElementById('coordOutput').textContent='Set start and end points to see coordinates.';
   document.getElementById('exportBtn').style.display='none';
+  document.getElementById('rosBtn').style.display='none';
+  document.getElementById('rosBtnArmed').style.display='none';
+  document.getElementById('rosStatus').style.display='none';
   document.getElementById('detectResult').classList.remove('visible');
   document.getElementById('btnPlayAuto').style.display='none';
   draw();
@@ -1057,37 +1192,47 @@ function autoDetect(){
 // ══════════════════════════════════════════════════════════════
 function updateWeldCoords(){
   if(!weldStart||!weldEnd)return;
-  const dx=weldEnd.x-weldStart.x, dy=weldEnd.y-weldStart.y, dz=weldEnd.z-weldStart.z;
-  const len=Math.sqrt(dx*dx+dy*dy+dz*dz);
-  const nx=dx/len, ny=dy/len, nz=dz/len;
-  document.getElementById('sLen').textContent=(len*1000).toFixed(1)+' mm';
+  const ws = markerToWorld(weldStart);
+  const we = markerToWorld(weldEnd);
+  const dx = we[0]-ws[0], dy = we[1]-ws[1], dz = we[2]-ws[2];
+  const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const nx = len>0?dx/len:0, ny = len>0?dy/len:0, nz = len>0?dz/len:0;
+  document.getElementById('sLen').textContent = fmtLen(len);
   document.getElementById('coordOutput').innerHTML=
     `<span class="lbl" style="color:var(--green)">START</span><br>`+
-    `x: <span class="val">${cm(weldStart.x)}</span><br>`+
-    `y: <span class="val">${cm(weldStart.y)}</span><br>`+
-    `z: <span class="val">${cm(weldStart.z)}</span><br><br>`+
+    `x: <span class="val">${fmtAxis(ws[0])}</span><br>`+
+    `y: <span class="val">${fmtAxis(ws[1])}</span><br>`+
+    `z: <span class="val">${fmtAxis(ws[2])}</span><br><br>`+
     `<span class="lbl" style="color:var(--blue)">END</span><br>`+
-    `x: <span class="val">${cm(weldEnd.x)}</span><br>`+
-    `y: <span class="val">${cm(weldEnd.y)}</span><br>`+
-    `z: <span class="val">${cm(weldEnd.z)}</span><br><br>`+
+    `x: <span class="val">${fmtAxis(we[0])}</span><br>`+
+    `y: <span class="val">${fmtAxis(we[1])}</span><br>`+
+    `z: <span class="val">${fmtAxis(we[2])}</span><br><br>`+
     `<span class="lbl" style="color:var(--warn)">DIRECTION</span><br>`+
     `x: <span class="val">${nx.toFixed(4)}</span><br>`+
     `y: <span class="val">${ny.toFixed(4)}</span><br>`+
     `z: <span class="val">${nz.toFixed(4)}</span><br><br>`+
-    `<span class="lbl">LENGTH</span> <span class="len">${(len*1000).toFixed(2)} mm</span>`;
+    `<span class="lbl">LENGTH</span> <span class="len">${fmtLen(len)}</span>`+
+    (currentScaleSource ? `<br><span class="lbl" style="color:var(--muted);font-size:10px">scale: ${currentScaleSource}</span>` : '');
   document.getElementById('exportBtn').style.display='';
+  document.getElementById('rosBtn').style.display='';
+  document.getElementById('rosBtnArmed').style.display='';
+  document.getElementById('rosStatus').style.display='none';
 }
 
 function exportJSON(){
   if(!weldStart||!weldEnd)return;
-  const dx=weldEnd.x-weldStart.x, dy=weldEnd.y-weldStart.y, dz=weldEnd.z-weldStart.z;
-  const len=Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const ws = markerToWorld(weldStart);
+  const we = markerToWorld(weldEnd);
+  const dx = we[0]-ws[0], dy = we[1]-ws[1], dz = we[2]-ws[2];
+  const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const units = currentScale === 1.0 ? 'vggt_units' : 'meters';
   const data={weld_path:{
-    start:{x:weldStart.x,y:weldStart.y,z:weldStart.z},
-    end:{x:weldEnd.x,y:weldEnd.y,z:weldEnd.z},
-    direction:{x:dx/len,y:dy/len,z:dz/len},
-    length_m:+len.toFixed(6), length_mm:+(len*1000).toFixed(3),
-    units:'meters'
+    start:{x:ws[0],y:ws[1],z:ws[2]},
+    end:  {x:we[0],y:we[1],z:we[2]},
+    direction:{x:len>0?dx/len:0, y:len>0?dy/len:0, z:len>0?dz/len:0},
+    length:+len.toFixed(6),
+    length_mm: currentScale === 1.0 ? null : +(len*1000).toFixed(3),
+    units, scale_source: currentScaleSource,
   }, meta:{exported_at:new Date().toISOString(),source:'weld_path_planner'}};
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
@@ -1128,8 +1273,8 @@ function animPlay(){
 // View controls
 // ══════════════════════════════════════════════════════════════
 function toggleAxes(){showAxes=!showAxes;document.getElementById('btnAxes').classList.toggle('active',showAxes);draw();}
-function resetView(){cam={rotX:-.35,rotY:.45,zoom:1,panX:0,panY:0};draw();}
-function fitView(){cam.zoom=1;cam.panX=0;cam.panY=0;cam.rotX=-.35;cam.rotY=.45;draw();}
+function resetView(){cam={rotX:-0.55,rotY:0.0,zoom:1,panX:0,panY:0};draw();}
+function fitView(){cam.zoom=1;cam.panX=0;cam.panY=0;cam.rotX=-0.55;cam.rotY=0.0;draw();}
 document.getElementById('ptSize').addEventListener('input',e=>{document.getElementById('ptSizeV').textContent=e.target.value;draw();});
 document.getElementById('opacity').addEventListener('input',e=>{document.getElementById('opacityV').textContent=e.target.value;draw();});
 
@@ -1137,6 +1282,18 @@ document.getElementById('opacity').addEventListener('input',e=>{document.getElem
 // Helpers
 // ══════════════════════════════════════════════════════════════
 function cm(m)  { return (m*100).toFixed(2)+'cm'; }
+// Cloud-frame marker → world-axes display vector (un-flip Y, apply scale).
+// When currentScale === 1.0, the result is in raw VGGT units instead of metres.
+function markerToWorld(m) {
+  return [m.x * currentScale, -m.y * currentScale, m.z * currentScale];
+}
+// Cloud-frame point components (already in display order if cloud-frame).
+function fmtAxis(v) {
+  return currentScale === 1.0 ? v.toFixed(4)+'u' : (v*100).toFixed(2)+'cm';
+}
+function fmtLen(v) {
+  return currentScale === 1.0 ? v.toFixed(4)+' u' : (v*1000).toFixed(1)+' mm';
+}
 function setStatus(s){ document.getElementById('hStatus').textContent=s; }
 let toastTO;
 function toast(msg){
@@ -1146,6 +1303,61 @@ function toast(msg){
 }
 
 resize();
+
+// ══════════════════════════════════════════════════════════════
+// ROS2 Bridge — send weld path to robot via server.py
+// ══════════════════════════════════════════════════════════════
+async function sendToRobot(armed) {
+  if (!weldStart || !weldEnd) { toast('Set start and end first'); return; }
+  if (currentScale === 1.0) {
+    toast('No metric scale — refusing to send unscaled coords to robot');
+    return;
+  }
+
+  const statusEl = document.getElementById('rosStatus');
+  statusEl.style.display = '';
+  statusEl.style.color = 'var(--muted)';
+  statusEl.textContent = armed ? '⚡ Sending live weld command…' : '⬡ Sending dry-run…';
+
+  const ws = markerToWorld(weldStart);   // metres, world axes (un-flipped Y)
+  const we = markerToWorld(weldEnd);
+  const payload = {
+    start:      [ws[0], ws[1], ws[2]],
+    end:        [we[0], we[1], we[2]],
+    armed:      armed,
+    speed_mm_s: 5.0,
+    procedure:  1,
+    schedule:   1
+  };
+
+  try {
+    const res  = await fetch('/send_to_robot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+
+    if (data.errors && data.errors.length > 0) {
+      statusEl.style.color = 'var(--warn)';
+      statusEl.innerHTML =
+        '⚠ ' + data.message + '<br>' +
+        data.errors.map(e => '  ' + e).join('<br>');
+    } else {
+      statusEl.style.color = 'var(--green)';
+      statusEl.innerHTML =
+        (armed ? '⚡ ' : '⬡ ') + data.message + '<br>' +
+        Object.entries(data.results)
+          .map(([k,v]) => k + ': ' + v)
+          .join('<br>');
+    }
+    toast(data.message);
+  } catch (err) {
+    statusEl.style.color = 'var(--red,#ff5f5f)';
+    statusEl.textContent = '✗ Could not reach server: ' + err.message;
+    toast('ROS2 send failed: ' + err.message);
+  }
+}
 </script>
 </body>
 </html>
