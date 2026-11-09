@@ -1,0 +1,12 @@
+
+# Metric3D camera calibration learned at runtime (per-machine)
+camera_calib.json
+
+# Local validation and Python artifacts
+__pycache__/
+validation_output/
+validation_pipeline*.log
+
+# Kept in their own repos: the Gazebo simulator and the ROS welding robot
+sim/
+welding_robot_ros-develop/

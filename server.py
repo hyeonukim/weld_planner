@@ -3,9 +3,9 @@
 server.py  —  Weld Path Planner backend
 ========================================
 VGGT (multi-view 3-D reconstruction) provides the shared world frame.
-Weld-seam endpoints are detected per view in 2-D, lifted into VGGT's
-world frame via `world_points`, then fused across views with a single
-PCA fit — no per-view averaging across different camera frames.
+Seam candidates are extracted from shared world geometry and traced by
+local connectivity. Planar intersections yield straight paths; narrow
+ridges and explicitly selected base contacts can yield curved paths.
 
 Metric3D v2 (YvanYin/Metric3D, torch.hub) is *optional* and used only
 to derive an absolute (metres) scale factor by comparing its depth
@@ -16,9 +16,12 @@ together with a `scale_factor: null` flag.
 Dependencies:
   pip install torch torchvision flask flask-cors numpy matplotlib
               opencv-contrib-python Pillow timm
+  # Metric3D (optional absolute scale) additionally needs:
+  pip install mmengine mmcv-lite
 """
 
 import os, json, uuid, threading, tempfile, traceback, queue, math
+from seam_path import trace_path, trace_loop, trim_end_hooks, depth_views, align_depth
 from flask import Flask, request, jsonify, send_file, Response, send_from_directory
 from flask_cors import CORS
 
@@ -51,9 +54,89 @@ _M3D_LOAD_DEVICE    = None     # ditto for Metric3D
 PLY_CONF_THRESH = 1.0   # drop VGGT points below this confidence
 PLY_DOWNSAMPLE  = 4     # keep every Nth point after filtering (1 = no downsample)
 
+# Scene crop: keep only the fixture table and the object(s) resting on it,
+# discarding the wall / floor / background and any hovering equipment. Applies
+# to both the rendered point cloud and seam detection.
+CROP_TO_TABLE    = True    # master switch; False → full-scene (legacy) behaviour
+CROP_MARGIN      = 0.02    # expand the table footprint by this fraction
+CROP_HEIGHT_FRAC = 0.5     # max object height as a fraction of table extent
+CROP_VOXEL_FRAC  = 0.015   # cluster voxel size as a fraction of scene diagonal
+
+# Workpiece height prominence: a cluster must rise at least this many multiples
+# of the table-flatness tolerance above the table to count as workpiece.
+# Rejects rust/discolouration patches whose noisy depth pokes a few mm above
+# the plane and would otherwise drag the seam path onto fake corners.
+PART_MIN_HEIGHT_MULT = 8
+
+# Workpiece cut above the table, in robust standard deviations of the table's
+# own surface noise (bounded to [0.1, 3] × the table-fit tolerance).
+PART_CUT_SIGMA = 4
+# Inter-part seam: members must meet at a real angle, and this fraction of the
+# surface above the base must face along one of the two plates (measured:
+# real upright T ≈ 0.48, pipes / curved walls ≤ 0.23).
+MEMBER_MIN_ANGLE_DEG = 30
+MEMBER_FLAT_FRAC = 0.4
+
 # Fixture-table hole grid: holes are 50 mm centre-to-centre. Hough params
 # are guessed from VGGT-native image width (518 px); they auto-scale with W.
 HOLE_SPACING_M = 0.050
+
+# Metric3D model variant: 'small' (ViT-S) is much faster to load/run; 'large'
+# (ViT-L) is more accurate raw. Since Metric3D is anchored to the fixture holes,
+# the small model's accuracy gap is absorbed by the learned calibration — so we
+# default to the faster one. Speed > raw Metric3D accuracy here.
+M3D_VARIANT = 'small'
+
+# Headline measurement scale source:
+#   'metric3d+holes' — Metric3D anchored to the fixture holes. Holes are treated
+#                      as ground truth when present (Metric3D's scale snaps to
+#                      them, and the correction is remembered); off-fixture,
+#                      Metric3D — corrected by the saved calibration — carries the
+#                      scale. Metric3D runs every job (~3 fast ViT-S passes).
+#   'holes'          — holes preferred; Metric3D only when no holes are found
+#                      (fast path — Metric3D skipped on fixture shots).
+# VGGT supplies the seam *geometry* in both; the rendered cloud stays raw.
+MEASUREMENT_SCALE = 'metric3d+holes'
+
+# Metric3D scale calibration. Metric3D's raw metric scale has a systematic
+# per-camera error (unknown focal length + model bias on shiny metal). When the
+# 50 mm fixture holes are visible we treat their scale as ground truth, learn a
+# multiplicative correction so Metric3D matches it, persist it, and reuse it on
+# later fixture-less shots from the same camera. Pure scale multiplier →
+# resolution-independent.
+_M3D_CALIB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'camera_calib.json')
+_M3D_CORRECTION = None      # multiplier applied to Metric3D's raw scale
+
+
+def _load_m3d_calib():
+    # A correction is only valid for the model variant it was learned with
+    # (ViT-S and ViT-L have different raw bias), so ignore mismatches → re-learn.
+    global _M3D_CORRECTION
+    try:
+        with open(_M3D_CALIB_PATH) as f:
+            d = json.load(f)
+        c = float(d.get('metric3d_correction'))
+        if d.get('variant', M3D_VARIANT) == M3D_VARIANT and 0 < c < 1e6:
+            _M3D_CORRECTION = c
+        else:
+            _M3D_CORRECTION = None
+    except Exception:
+        _M3D_CORRECTION = None
+
+
+def _save_m3d_calib(correction):
+    global _M3D_CORRECTION
+    _M3D_CORRECTION = float(correction)
+    try:
+        with open(_M3D_CALIB_PATH, 'w') as f:
+            json.dump({'metric3d_correction': _M3D_CORRECTION,
+                       'variant': M3D_VARIANT}, f)
+    except Exception as e:
+        print(f'[Metric3D] could not persist calibration: {e}')
+
+
+_load_m3d_calib()
 
 # ─────────────────────────────────────────────────────────────
 # SSE helper
@@ -73,29 +156,47 @@ def _emit(q, event, data):
 _M3D_INPUT = (616, 1064)   # required input for Metric3D ViT-L / ViT-S
 
 
-def _load_metric3d(device):
-    try:
-        model = torch.hub.load(
-            'YvanYin/Metric3D', 'metric3d_vit_large', pretrain=True)
-        print('[Metric3D] Loaded ViT-L from torch.hub')
-    except Exception as e_l:
-        print(f'[Metric3D] ViT-L unavailable ({e_l}), trying ViT-S...')
+def _load_metric3d(device, variant='small'):
+    # NOTE: the hub repo needs `mmengine` + `mmcv-lite` importable (it imports
+    # mmcv.utils / mmengine.Config). Without them the load raises ModuleNotFound
+    # and Metric3D is silently skipped. Weights download once (ViT-S ~ a few
+    # hundred MB, ViT-L ~1.3 GB). Try the requested variant first, then fall back.
+    order = (['metric3d_vit_small', 'metric3d_vit_large'] if variant == 'small'
+             else ['metric3d_vit_large', 'metric3d_vit_small'])
+    model = None
+    for name in order:
         try:
-            model = torch.hub.load(
-                'YvanYin/Metric3D', 'metric3d_vit_small', pretrain=True)
-            print('[Metric3D] Loaded ViT-S from torch.hub')
-        except Exception as e_s:
-            print(f'[Metric3D] Unavailable ({e_s}); '
-                  f'continuing without absolute scale.')
-            return None
+            model = torch.hub.load('YvanYin/Metric3D', name,
+                                   pretrain=True, trust_repo=True)
+            print(f'[Metric3D] Loaded {name} from torch.hub')
+            break
+        except Exception as e:
+            print(f'[Metric3D] {name} unavailable ({e})')
+    if model is None:
+        print('[Metric3D] Unavailable; continuing without absolute scale.')
+        return None
     model.to(device).eval()
     return model
 
 
-def _run_metric3d(model, image_path, device, intrinsics=None):
+_M3D_CANONICAL_FOCAL = 1000.0   # canonical-camera focal used by Metric3D ViT
+
+
+def _run_metric3d(model, image_path, device, intrinsics=None, focal_norm=None):
     """
     Returns (depth H×W float32 in metres, (fx, fy, cx, cy) at original size).
     Returns (None, None) if model is None.
+
+    Follows the official Metric3D ViT recipe: aspect-preserving resize + pad to
+    the model input, run `inference(data) -> (pred_depth, conf, out)`, then undo
+    the canonical-camera transform (depth_metric = depth_canonical · fx_resized /
+    1000) so the result is in metres. Earlier code targeted a stale API
+    (`inference(..., cam_intrinsic=...)['prediction']`) which raised on the
+    current repo, leaving Metric3D silently disabled.
+
+    Focal length priority: explicit `intrinsics` > `focal_norm` (fx/imageWidth,
+    e.g. from a user FOV) > 70° HFOV guess. Metric3D depth scales linearly with
+    the focal, so this directly controls the absolute scale.
     """
     if model is None:
         return None, None
@@ -107,32 +208,40 @@ def _run_metric3d(model, image_path, device, intrinsics=None):
 
     if intrinsics and len(intrinsics) == 4:
         fx, fy, cx, cy = [float(v) for v in intrinsics]
+    elif focal_norm:
+        fx = fy = float(focal_norm) * w0
+        cx, cy  = w0 / 2.0, h0 / 2.0
     else:
-        # 70° HFOV fallback — acceptable for ViT-L on phone-camera framing
+        # 70° HFOV fallback — acceptable for ViT on phone-camera framing
         fx = fy = w0 / (2 * np.tan(np.radians(70) / 2))
         cx, cy  = w0 / 2.0, h0 / 2.0
 
+    # Aspect-preserving resize into the model input, then pad with the mean RGB.
     in_h, in_w = _M3D_INPUT
-    s_h, s_w = in_h / h0, in_w / w0
-    fx_s, fy_s = fx * s_w, fy * s_h
-    cx_s, cy_s = cx * s_w, cy * s_h
-    rgb_r = cv2.resize(rgb, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
-
+    scale = min(in_w / w0, in_h / h0)
+    rw, rh = int(round(w0 * scale)), int(round(h0 * scale))
+    rgb_r = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    pad_h, pad_w = in_h - rh, in_w - rw
+    pt, pb = pad_h // 2, pad_h - pad_h // 2
+    pl, pr = pad_w // 2, pad_w - pad_w // 2
     mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
     std  = np.array([58.395,  57.12,  57.375], dtype=np.float32)
+    rgb_p = cv2.copyMakeBorder(rgb_r, pt, pb, pl, pr,
+                               cv2.BORDER_CONSTANT, value=mean.tolist())
+
     img_t = torch.from_numpy(
-        ((rgb_r.astype(np.float32) - mean) / std).transpose(2, 0, 1)
+        ((rgb_p.astype(np.float32) - mean) / std).transpose(2, 0, 1)
     ).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred = model.inference(
-            {'input': img_t},
-            cam_model=None,
-            pad_info=None,
-            normalize_scale=None,
-            cam_intrinsic={'fx': fx_s, 'fy': fy_s, 'cx': cx_s, 'cy': cy_s},
-        )
-    depth_s = pred['prediction'].squeeze().cpu().numpy()    # (in_h, in_w)
+        pred_depth, _conf, _out = model.inference({'input': img_t})
+
+    pred_depth = pred_depth.squeeze()
+    # Strip the padding, then undo the canonical-camera scaling → metres.
+    pred_depth = pred_depth[pt:pred_depth.shape[0] - pb,
+                            pl:pred_depth.shape[1] - pr]
+    pred_depth = pred_depth * (fx * scale / _M3D_CANONICAL_FOCAL)
+    depth_s = pred_depth.cpu().numpy()                       # (rh, rw)
     depth   = cv2.resize(depth_s, (w0, h0), interpolation=cv2.INTER_LINEAR)
     return depth.astype(np.float32), (fx, fy, cx, cy)
 
@@ -369,6 +478,202 @@ def _ransac_plane(pts, n_iters=300, thresh=0.005, seed=0):
     return n, d, mask
 
 
+def _fit_table(flat_pts, flat_conf=None, conf_thresh=1.0):
+    """
+    RANSAC the dominant plane (= the fixture table) over the valid points and
+    return a dict describing the table frame, or None if no usable plane.
+
+    Keys: n, d (oriented plane, normal → workpiece side); u, v (orthonormal
+    in-plane basis); u_lo/u_hi/v_lo/v_hi (robust footprint bounds); thresh
+    (flatness tolerance); height_cap (max object height); scene_diag.
+    """
+    valid = ~np.all(flat_pts == 0, axis=1)
+    if flat_conf is not None:
+        valid &= flat_conf > conf_thresh
+    pts = flat_pts[valid].astype(np.float64)
+    if len(pts) < 100:
+        return None
+
+    diag = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) or 1.0
+    thresh = 0.003 * diag
+
+    ss_n = min(50000, len(pts))
+    if ss_n < len(pts):
+        idx = np.random.default_rng(0).choice(len(pts), ss_n, replace=False)
+        ss = pts[idx]
+    else:
+        ss = pts
+
+    n, d, _ = _ransac_plane(ss, n_iters=300, thresh=thresh)
+    if n is None:
+        return None
+
+    # Orient the normal toward the workpiece side (see _segment_workpiece).
+    signed = pts @ n + d
+    off_mask = np.abs(signed) > thresh * 3
+    if int(off_mask.sum()) and float(signed[off_mask].mean()) < 0:
+        n, d = -n, -d
+        signed = -signed
+
+    table_pts = pts[np.abs(signed) < thresh]
+    if len(table_pts) < 10:
+        return None   # can't define a footprint → caller falls back to no-crop
+
+    # Orthonormal in-plane basis (u, v) spanning the table surface.
+    a = np.array([1.0, 0.0, 0.0])
+    if abs(float(n @ a)) > 0.9:
+        a = np.array([0.0, 1.0, 0.0])
+    u = a - (a @ n) * n
+    u = u / (np.linalg.norm(u) or 1.0)
+    v = np.cross(n, u)
+
+    tu, tv = table_pts @ u, table_pts @ v
+    u_lo, u_hi = np.percentile(tu, [1, 99])   # robust table outline
+    v_lo, v_hi = np.percentile(tv, [1, 99])
+    height_cap = CROP_HEIGHT_FRAC * max(u_hi - u_lo, v_hi - v_lo)
+
+    # Height above which a point belongs to the workpiece, from the table's
+    # MEASURED surface noise. `thresh` scales with the whole scene (floor and
+    # background included), so 3·thresh can sit centimetres above the table
+    # and swallow a thin base plate together with the weld root standing on it.
+    res = signed[np.abs(signed) < thresh]
+    sigma = 1.4826 * float(np.median(np.abs(res - np.median(res))))
+    part_cut = min(3 * thresh, max(PART_CUT_SIGMA * sigma, 0.1 * thresh))
+
+    return {'n': n, 'd': d, 'u': u, 'v': v,
+            'u_lo': u_lo, 'u_hi': u_hi, 'v_lo': v_lo, 'v_hi': v_hi,
+            'thresh': thresh, 'part_cut': part_cut,
+            'height_cap': height_cap, 'scene_diag': diag}
+
+
+def _voxel_components(band_pts, voxel):
+    """
+    Voxel-grid connected-components (26-neighbour, union-find). Returns an
+    integer component label per point. Numpy-only — no scipy/sklearn.
+    """
+    keys = np.floor(band_pts / voxel).astype(np.int64)
+    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+    M = len(uniq)
+    index = {(int(a), int(b), int(c)): i for i, (a, b, c) in enumerate(uniq)}
+
+    parent = list(range(M))
+
+    def find(x):
+        r = x
+        while parent[r] != r:
+            r = parent[r]
+        while parent[x] != r:
+            parent[x], x = r, parent[x]
+        return r
+
+    offs = [(dx, dy, dz)
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)]
+    for i in range(M):
+        a, b, c = int(uniq[i][0]), int(uniq[i][1]), int(uniq[i][2])
+        for dx, dy, dz in offs:
+            j = index.get((a + dx, b + dy, c + dz))
+            if j is not None and j > i:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    roots = np.array([find(i) for i in range(M)])
+    return roots[inv]                                   # component per point
+
+
+def _cluster_keep_mask(band_pts, signed, table):
+    """
+    Keep every component that has at least one point resting on the table
+    (low signed height); drop free-floating components such as a hovering
+    welding torch. Returns a boolean mask over band_pts.
+    """
+    N = len(band_pts)
+    if N < 10:
+        return np.ones(N, bool)
+    voxel = max(CROP_VOXEL_FRAC * table['scene_diag'], 1e-9)
+    comp = _voxel_components(band_pts, voxel)
+    anchored = np.unique(comp[signed <= table['thresh'] * 3])
+    if len(anchored) == 0:
+        return np.ones(N, bool)                         # fallback: keep all
+    return np.isin(comp, anchored)
+
+
+def _tall_cluster_mask(pts, signed, table, min_height_mult=PART_MIN_HEIGHT_MULT):
+    """
+    Keep only clusters PROMINENT in DEPTH: a real workpiece rises centimetres
+    above the table, while rust stains / discolouration only corrupt VGGT's
+    depth by a few millimetres. Filtering fake 'workpiece' bumps here keeps
+    the seam path anchored to genuine geometric edges instead of appearance
+    artefacts. Falls back to keeping everything if no cluster qualifies.
+    Returns a boolean mask over pts.
+    """
+    N = len(pts)
+    if N < 10:
+        return np.ones(N, bool)
+    # Half the crop voxel: at the crop's resolution a rust patch NEXT TO the
+    # part bridges into its cluster and inherits "tall" status. Finer voxels
+    # keep low noise patches as separate (droppable) components.
+    voxel = max(0.5 * CROP_VOXEL_FRAC * table['scene_diag'], 1e-9)
+    comp = _voxel_components(pts, voxel)
+    min_h = table['thresh'] * min_height_mult
+    keep_ids = []
+    for c in np.unique(comp):
+        sel = signed[comp == c]
+        # 95th percentile height: robust "how tall is this cluster really"
+        if len(sel) >= 10 and float(np.percentile(sel, 95)) >= min_h:
+            keep_ids.append(c)
+    if not keep_ids:
+        return np.ones(N, bool)                         # never empty the set
+    return np.isin(comp, np.array(keep_ids))
+
+
+def _scene_crop_mask(flat_pts, table):
+    """
+    Boolean keep-mask over flat_pts for "the table + the object(s) resting on
+    it": points inside the (margin-expanded) table footprint, from the table
+    surface up to height_cap, with free-floating clusters removed.
+    """
+    n, d = table['n'], table['d']
+    signed = flat_pts @ n + d
+    pu, pv = flat_pts @ table['u'], flat_pts @ table['v']
+    mu = CROP_MARGIN * (table['u_hi'] - table['u_lo'])
+    mv = CROP_MARGIN * (table['v_hi'] - table['v_lo'])
+    on_fp = ((pu >= table['u_lo'] - mu) & (pu <= table['u_hi'] + mu) &
+             (pv >= table['v_lo'] - mv) & (pv <= table['v_hi'] + mv))
+
+    valid = ~np.all(flat_pts == 0, axis=1)
+    band = (on_fp & valid &
+            (signed >= -table['thresh']) & (signed < table['height_cap']))
+
+    keep = np.zeros(len(flat_pts), bool)
+    idx = np.where(band)[0]
+    if len(idx) == 0:
+        return keep
+    cl = _cluster_keep_mask(flat_pts[idx].astype(np.float64), signed[idx], table)
+    keep[idx[cl]] = True
+    return keep
+
+
+def _view_align_matrix(table):
+    """
+    3×3 world→aligned rotation that maps the table normal to the viewer's "up"
+    (+y), so the front-end turntable spins horizontally about the table's true
+    vertical instead of the arbitrary VGGT data axis. Row-major (rows = aligned
+    x, y, z axes in world coords). Returns a nested list or None if degenerate.
+    """
+    ey = np.asarray(table['n'], np.float64)
+    ex = np.asarray(table['u'], np.float64)
+    ez = np.cross(ex, ey)
+    nz = np.linalg.norm(ez)
+    if nz < 1e-9:
+        return None
+    ez = ez / nz
+    ex = np.cross(ey, ez)                       # re-orthogonalise
+    ex = ex / (np.linalg.norm(ex) or 1.0)
+    return np.vstack([ex, ey, ez]).tolist()
+
+
 def _segment_workpiece(world_pts, conf=None, conf_thresh=1.0):
     """
     RANSAC the dominant plane (= the fixture table) and return the points
@@ -410,23 +715,341 @@ def _segment_workpiece(world_pts, conf=None, conf_thresh=1.0):
         n, d = -n, -d
         signed = -signed
 
-    workpiece = pts[signed > thresh * 3]
+    # Restrict the workpiece to points that sit ABOVE the table AND OVER the
+    # table's physical footprint. Without this, a wall / shelf / equipment in
+    # the background is also "off the table plane" and gets mistaken for the
+    # workpiece, sending the seam onto the wall. We bound candidates by the
+    # in-plane extent of the table-plane inliers and cap their height.
+    above = signed > thresh * 3
+    table_mask = np.abs(signed) < thresh
+    table_pts = pts[table_mask]
+    if len(table_pts) >= 10:
+        # Orthonormal in-plane basis (u, v) spanning the table surface.
+        a = np.array([1.0, 0.0, 0.0])
+        if abs(float(n @ a)) > 0.9:
+            a = np.array([0.0, 1.0, 0.0])
+        u = a - (a @ n) * n
+        u = u / (np.linalg.norm(u) or 1.0)
+        v = np.cross(n, u)
+
+        tu, tv = table_pts @ u, table_pts @ v
+        # 1st/99th pct → robust table outline (ignores a few stray inliers)
+        u_lo, u_hi = np.percentile(tu, [1, 99])
+        v_lo, v_hi = np.percentile(tv, [1, 99])
+        # Small margin so a workpiece touching the table edge isn't clipped.
+        mu, mv = 0.02 * (u_hi - u_lo), 0.02 * (v_hi - v_lo)
+
+        pu, pv = pts @ u, pts @ v
+        on_table = ((pu >= u_lo - mu) & (pu <= u_hi + mu) &
+                    (pv >= v_lo - mv) & (pv <= v_hi + mv))
+
+        # Height cap: workpieces sit low on the table; reject anything taller
+        # than half the table's in-plane extent (kills tall background walls
+        # that still overlap the footprint in projection).
+        height_cap = 0.5 * max(u_hi - u_lo, v_hi - v_lo)
+        above = above & on_table & (signed < height_cap)
+
+    workpiece = pts[above]
     return n, d, workpiece, diag
 
 
-def _detect_seam_geometric(workpiece_pts, scene_diag):
+def _reject_far_outliers(pts, k=3.0):
     """
-    Auto-pick t-joint vs groove and return (start_3d, end_3d, method).
+    Drop points far from the bulk of the workpiece using a robust median + MAD
+    radius. Detached reconstruction noise (a floating clump off to the side)
+    otherwise gets chosen as a seam endpoint. Conservative: only trims points
+    well beyond the main mass, so a genuinely elongated seam is preserved.
+    """
+    if pts is None or len(pts) < 20:
+        return pts
+    c  = np.median(pts, axis=0)
+    d  = np.linalg.norm(pts - c, axis=1)
+    md = float(np.median(d))
+    mad = float(np.median(np.abs(d - md)))
+    if mad < 1e-9:
+        return pts
+    keep = d <= md + k * 1.4826 * mad
+    return pts[keep] if int(keep.sum()) >= 20 else pts
 
+
+def _rdp_simplify(pts, eps):
+    """
+    Douglas–Peucker polyline simplification. Removes waypoints that deviate
+    less than `eps` from the local straight run. This is what keeps ARC LENGTH
+    honest: a noisy-but-straight seam collapses to its chord instead of
+    accumulating zigzag length, while a genuine curve keeps its shape.
+    """
+    if len(pts) < 3:
+        return pts
+    a, b = pts[0], pts[-1]
+    ab = b - a
+    L = float(np.linalg.norm(ab))
+    if L < 1e-12:
+        d = np.linalg.norm(pts - a, axis=1)
+    else:
+        u = ab / L
+        rel = pts - a
+        d = np.linalg.norm(rel - np.outer(rel @ u, u), axis=1)
+    i = int(np.argmax(d))
+    if d[i] > eps:
+        left  = _rdp_simplify(pts[:i + 1], eps)
+        right = _rdp_simplify(pts[i:], eps)
+        return np.vstack([left[:-1], right])
+    return np.vstack([a, b])
+
+
+def _extract_seam_path(seam_pts, line_dir, p0, scene_diag,
+                       n_bins=40, min_pts_per_bin=3):
+    """Trace local connectivity instead of sorting a curved joint on one axis."""
+    return trace_path(seam_pts, scene_diag)
+
+
+def _path_arc_length(path):
+    return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+
+
+def _contact_seam(workpiece_pts, n, d, thresh, part_extent, scene_diag):
+    """
+    Trace where a standing member MEETS a base surface (plane n·p+d=0),
+    following any curvature of the member.
+
+    Points in a thin band just above the base plane that (a) sit over the
+    base surface and (b) continue upward into a rising wall are the root of
+    the joint. Dropping them onto the plane gives the weld-root footprint,
+    which is traced by local connectivity (open seams) or angle (closed
+    loops, e.g. pipe-to-plate). Straight walls give a 2-point path, curved
+    walls a dense polyline.
+
+    Returns (path, info) or (None, reason).
+    """
+    from scipy.spatial import cKDTree
+    from scipy.sparse.csgraph import connected_components
+    n = np.asarray(n, np.float64)
+    n = n / (np.linalg.norm(n) or 1.0)
+    h = workpiece_pts @ n + d
+    off = np.abs(h) > thresh * 3
+    if int(off.sum()) < 30:
+        return None, 'no-off-plane'
+    if float(h[off].mean()) < 0:          # orient toward the standing member
+        n, d, h = -n, -d, -h
+    base = workpiece_pts[np.abs(h) < thresh * 1.5]
+    if len(base) < 30:
+        return None, 'no-base'
+
+    lo = thresh * 1.5
+    band_h = max(3 * thresh, 0.02 * part_extent)
+    hi = lo + band_h
+    band_m = (h > lo) & (h <= hi)
+    upper_m = (h > hi) & (h <= hi + 3 * band_h)
+    if band_m.sum() < 15 or upper_m.sum() < 15:
+        return None, 'no-rising-wall'
+    band, hb = workpiece_pts[band_m], h[band_m]
+
+    # (a) the band must continue upward (a wall), not be a low skirt/warp
+    r_up = 2.0 * band_h
+    rising = cKDTree(workpiece_pts[upper_m]).query(band, distance_upper_bound=r_up)[0] < np.inf
+    # (b) its footprint must land on / next to the base surface
+    foot = band - np.outer(hb, n)
+    base_foot = base - np.outer(base @ n + d, n)
+    r_base = 1.5 * band_h
+    on_base = cKDTree(base_foot).query(foot, distance_upper_bound=r_base)[0] < np.inf
+    foot = foot[rising & on_base]
+    if len(foot) < 15:
+        return None, 'no-supported-contact'
+
+    # Several standing members → keep the longest connected footprint.
+    tree = cKDTree(foot)
+    link = max(3 * band_h, 0.03 * part_extent)
+    pairs = tree.query_pairs(link, output_type='ndarray')
+    if len(pairs):
+        from scipy.sparse import coo_matrix
+        g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                       shape=(len(foot), len(foot)))
+        _, lab = connected_components(g, directed=False)
+        best, best_ext = None, -1.0
+        for c in np.unique(lab):
+            sel = foot[lab == c]
+            if len(sel) < 15:
+                continue
+            ext = float(np.linalg.norm(np.ptp(sel, axis=0)))
+            if ext > best_ext:
+                best, best_ext = sel, ext
+        if best is None:
+            return None, 'no-supported-contact'
+        foot = best
+
+    # A well-covered ring (pipe-to-plate) must be traced as a loop first: the
+    # open tracer also "succeeds" on it, but keeps only part of the circle.
+    path = trace_loop(foot)
+    if path is not None:
+        return path, f'closed,band={len(foot)}'
+    path = trace_path(foot, scene_diag)
+    if path is not None and len(path) > 2:
+        # Thick plates: drop the wrap-around at the plate's end faces.
+        eps = max(2 * thresh, 0.02 * float(np.linalg.norm(np.ptp(foot, axis=0))))
+        path = trim_end_hooks(path, eps)
+    if path is not None:
+        # A seam only exists where BOTH the base face and the standing member
+        # are present next to it; stray points can extend the footprint past
+        # the part's real ends.
+        up = workpiece_pts[upper_m]
+        up_foot = up - np.outer(up @ n + d, n)
+        # Base support is measured AWAY from the root (2–6 band heights), so
+        # stray points that merely lie in the base plane next to the root
+        # don't count as base surface.
+        path = _clip_to_support(path, [(base_foot, 2.0 * band_h, 6.0 * band_h),
+                                       (up_foot, 0.0, 2.0 * band_h)])
+    if path is None:
+        return None, 'untraceable-contact'
+    return path, f'open,band={len(foot)}'
+
+
+def _resample(path, step):
+    arc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+    n = max(2, int(np.ceil(arc[-1] / max(step, 1e-12))) + 1)
+    s = np.linspace(0, arc[-1], n)
+    return s, np.column_stack([np.interp(s, arc, path[:, j]) for j in range(3)])
+
+
+def _clip_to_support(path, supports, lo_pct=0.2, hi_pct=99.8):
+    """Trim an open path to the arc range where every support set has points
+    beside it. `supports` is a list of (points, r_min, r_max): only points
+    whose distance to the path lies in [r_min, r_max] count. The path is left
+    unchanged if a set gives no usable range, and is never cut below 20 % of
+    its original length."""
+    from scipy.spatial import cKDTree
+    path = np.asarray(path, float)
+    total = _path_arc_length(path)
+    if total <= 0 or len(path) < 2:
+        return path
+    step = min(r for _, r, _ in [(None, rmax, None) for _, _, rmax in supports]) / 4
+    s, dense = _resample(path, step)
+    tree = cKDTree(dense)
+    lo, hi = 0.0, s[-1]
+    for pts, rmin, rmax in supports:
+        if pts is None or len(pts) < 10:
+            continue
+        dist, idx = tree.query(pts, distance_upper_bound=rmax)
+        near = np.isfinite(dist) & (dist >= rmin)
+        if near.sum() < 10:
+            continue
+        a, b = np.percentile(s[idx[near]], [lo_pct, hi_pct])
+        lo, hi = max(lo, a), min(hi, b)
+    if hi - lo < 0.2 * total:
+        return path
+    keep = (s >= lo) & (s <= hi)
+    if len(path) == 2:
+        return dense[keep][[0, -1]]
+    arc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+    inner = path[(arc > lo) & (arc < hi)]
+    ends = [np.array([np.interp(t, arc, path[:, j]) for j in range(3)]) for t in (lo, hi)]
+    return np.vstack([ends[0], inner, ends[1]])
+
+
+def _line_fit(path):
+    """PCA line through a polyline (densified so vertex spacing doesn't bias it).
+    Returns (centre, unit direction, 90th-pct perpendicular deviation)."""
+    _, dense = _resample(path, _path_arc_length(path) / 200)
+    c = dense.mean(axis=0)
+    u = np.linalg.svd(dense - c, full_matrices=False)[2][0]
+    rel = dense - c
+    dev = np.linalg.norm(rel - np.outer(rel @ u, u), axis=1)
+    return c, u, float(np.percentile(dev, 90))
+
+
+def _max_dev_from_line(path, p0, u):
+    rel = path - p0
+    return float(np.max(np.linalg.norm(rel - np.outer(rel @ u, u), axis=1)))
+
+
+def _member_seam(workpiece_pts, ss, n1, d1, mask1, table_n, table_d, thresh, scene_diag):
+    """
+    Seam between two flat members standing above the base (an upright T, a
+    corner of two plates), ignoring the base itself. Returns the
+    _detect_seam_geometric tuple, or None when the parts above the base are
+    not two genuine plates (a pipe or curved wall also yields two RANSAC
+    "planes", as chords, but its surface normals do not line up with them).
+    """
+    # Base: the dominant plane when it lies along the table, else the table.
+    base_n, base_d = n1, d1
+    if table_n is not None and table_d is not None:
+        tn = np.asarray(table_n, np.float64)
+        tnn = float(np.linalg.norm(tn)) or 1.0
+        if abs(float(n1 @ tn)) / tnn < 0.9 or mask1.sum() < 0.1 * len(ss):
+            base_n, base_d = tn / tnn, float(table_d) / tnn
+    h = ss @ base_n + base_d
+    if (h > 3 * thresh).sum() < (h < -3 * thresh).sum():
+        base_n, base_d, h = -base_n, -base_d, -h
+    mem = ss[h > 3 * thresh]
+    if len(mem) < 200:
+        return None
+
+    na, da, ma = _ransac_plane(mem, n_iters=300, thresh=thresh, seed=1)
+    if na is None or len(mem) - ma.sum() < 100:
+        return None
+    nb, db, mb = _ransac_plane(mem[~ma], n_iters=300, thresh=thresh, seed=2)
+    if (nb is None or mb.sum() < max(100, 0.15 * ma.sum())
+            or abs(float(na @ nb)) > np.cos(np.radians(MEMBER_MIN_ANGLE_DEG))):
+        return None
+
+    # Flat members: most local surface normals agree with one of the planes.
+    from scipy.spatial import cKDTree
+    sub = mem[np.random.default_rng(3).choice(len(mem), min(8000, len(mem)),
+                                               replace=False)]
+    _, nbr = cKDTree(sub).query(sub, k=min(30, len(sub)))
+    q = sub[nbr] - sub[nbr].mean(axis=1, keepdims=True)
+    local_n = np.linalg.svd(q, full_matrices=False)[2][:, 2]
+    near = np.cos(np.radians(15))
+    flat = float(((np.abs(local_n @ na) > near) | (np.abs(local_n @ nb) > near)).mean())
+    if flat < MEMBER_FLAT_FRAC:
+        return None
+
+    line_dir = np.cross(na, nb)
+    line_dir /= np.linalg.norm(line_dir)
+    p0, *_ = np.linalg.lstsq(np.vstack([na, nb]), -np.array([da, db]), rcond=None)
+    above = workpiece_pts @ base_n + base_d > 3 * thresh
+    zone = (above & (np.abs(workpiece_pts @ na + da) < 2 * thresh)
+            & (np.abs(workpiece_pts @ nb + db) < 2 * thresh))
+    seam_pts = workpiece_pts[zone]
+    if len(seam_pts) < 4:
+        return None
+    projected = p0 + np.outer((seam_pts - p0) @ line_dir, line_dir)
+    path = _extract_seam_path(projected, line_dir, p0, scene_diag)
+    if path is None:
+        return None
+    return (path[0], path[-1],
+            f't-joint:members,pa={int(ma.sum())},pb={int(mb.sum())},'
+            f'flat={flat:.2f},seam={len(seam_pts)},wp={len(path)}',
+            path)
+
+
+def _detect_seam_geometric(workpiece_pts, scene_diag, table_n=None, table_d=None, joint_mode="auto"):
+    """
+    Auto-pick the seam and return (start_3d, end_3d, method, path) where
+    `path` is an ordered (N,3) waypoint array (N=2 for straight seams,
+    N>2 when the seam curves).
+
+      fillet   : standing plate ∩ KNOWN table plane → base weld line (preferred
+                 when the table plane is supplied; most robust for T/fillet welds)
       t-joint  : two strong workpiece planes → seam = plane1 ∩ plane2
       groove   : one plane + offset ridge    → seam = PCA on offset points
 
-    Returns (None, None, 'failed') if neither path produces a seam.
+    Returns (None, None, 'failed', None) if no strategy produces a seam.
     """
     if len(workpiece_pts) < 50:
-        return None, None, 'failed:too-few-workpiece-pts'
+        return None, None, 'failed:too-few-workpiece-pts', None
 
-    thresh = 0.005 * scene_diag
+    # Drop detached floating noise before any fitting, so endpoints can't snap
+    # to a stray clump off the workpiece.
+    workpiece_pts = _reject_far_outliers(workpiece_pts)
+    if len(workpiece_pts) < 50:
+        return None, None, 'failed:too-few-workpiece-pts', None
+
+    # Background extent must not set a centimetre-wide seam tolerance on a
+    # small part. Bound the fit tolerance by the robust workpiece extent.
+    part_extent = float(np.linalg.norm(np.percentile(workpiece_pts, 98, axis=0)
+                                      - np.percentile(workpiece_pts, 2, axis=0)))
+    thresh = max(1e-9, min(0.005 * scene_diag, 0.015 * part_extent))
 
     ss_n = min(30000, len(workpiece_pts))
     if ss_n < len(workpiece_pts):
@@ -437,7 +1060,7 @@ def _detect_seam_geometric(workpiece_pts, scene_diag):
 
     n1, d1, mask1 = _ransac_plane(ss, n_iters=300, thresh=thresh, seed=1)
     if n1 is None:
-        return None, None, 'failed:no-plane'
+        return None, None, 'failed:no-plane', None
     plane1_count = int(mask1.sum())
 
     n2 = d2 = None
@@ -448,12 +1071,58 @@ def _detect_seam_geometric(workpiece_pts, scene_diag):
         plane2_count = int(mask2.sum()) if mask2 is not None else 0
 
     is_tjoint = (n2 is not None
-                 and plane2_count > 0.30 * plane1_count
+                 and plane2_count > max(100, 0.15 * plane1_count)
                  and abs(float(n1 @ n2)) < 0.95)  # planes not parallel
 
     if is_tjoint:
         line_dir = np.cross(n1, n2)
         ln = np.linalg.norm(line_dir)
+
+    # ── Inter-part seam first: two flat members meeting above the base ──
+    # A part standing on a plate (or on the table) has two candidate welds:
+    # between its own members, and its footprint on the base. The member
+    # seam wins; the footprint trace below is the fallback (pipes, single
+    # walls, curved plates).
+    if joint_mode != "base":
+        member = _member_seam(workpiece_pts, ss, n1, d1, mask1, table_n, table_d,
+                              thresh, scene_diag)
+        if member is not None:
+            return member
+
+    # ── Contact trace: follow where a standing member meets a base face ──
+    # Works for straight AND curved members (C/S-shaped plates, pipes on a
+    # plate). A plane∩plane line can only ever be straight, so this decides
+    # whether the joint is really curved before the t-joint line is trusted.
+    contact = None
+    if joint_mode != "base":
+        bases = [(n1, d1)]
+        if n2 is not None and plane2_count > max(100, 0.05 * plane1_count):
+            bases.append((n2, d2))
+        # Prefer the dominant plane as the base (normally the base plate):
+        # using the standing wall as "base" makes the plate look like a wall
+        # rising along the wall's infinite plane, past the wall's real ends.
+        for bn, bd in bases:
+            cpath, cinfo = _contact_seam(workpiece_pts, bn, bd, thresh,
+                                         part_extent, scene_diag)
+            if cpath is not None:
+                contact = (cpath, cinfo)
+                break
+
+    # Decide straight vs curved from the traced footprint ITSELF. Comparing
+    # it to a plane∩plane line is unreliable: two noisy faces of the same
+    # plate can pass the "not parallel" test and give a meaningless line.
+    contact_straight = None
+    if contact is not None and joint_mode != "base":
+        cpath, cinfo = contact
+        closed = len(cpath) > 3 and np.allclose(cpath[0], cpath[-1])
+        if not closed:
+            seam_len = _path_arc_length(cpath)
+            c, u, dev90 = _line_fit(cpath)
+            if len(cpath) == 2 or dev90 <= max(2.5 * thresh, 0.02 * seam_len):
+                ts = np.sort((cpath[[0, -1]] - c) @ u)
+                contact_straight = (c, u, ts, dev90)
+
+    if is_tjoint and joint_mode != "base":
         if ln > 1e-6:
             line_dir = line_dir / ln
             # Closest point of two planes to origin (Moore–Penrose on 2×3 system)
@@ -469,30 +1138,89 @@ def _detect_seam_geometric(workpiece_pts, scene_diag):
                 d2_all = np.abs(workpiece_pts @ n2 + d2)
                 zone = (d1_all < thresh * 2.0) & (d2_all < thresh * 2.0)
                 seam_pts = workpiece_pts[zone]
-                if len(seam_pts) < 4:
-                    seam_pts = workpiece_pts
-                rel = seam_pts - p0
-                proj = rel @ line_dir
-                lo, hi = np.percentile(proj, [5, 95])
-                keep = (proj >= lo) & (proj <= hi)
-                if keep.sum() >= 2:
-                    proj_k = proj[keep]; pts_k = seam_pts[keep]
-                    return (pts_k[int(np.argmin(proj_k))],
-                            pts_k[int(np.argmax(proj_k))],
+                agrees = False
+                if contact is not None and contact_straight is not None:
+                    # Use the precise plane∩plane line only where the traced
+                    # root actually lies on it (and runs along it).
+                    c, u, ts, _ = contact_straight
+                    _, dense = _resample(contact[0], _path_arc_length(contact[0]) / 100)
+                    rel = dense - p0
+                    off = np.linalg.norm(rel - np.outer(rel @ line_dir, line_dir), axis=1)
+                    agrees = (abs(float(u @ line_dir)) > np.cos(np.radians(10))
+                              and np.percentile(off, 90) < 2.0 * thresh)
+                if contact is None and len(seam_pts) >= 4:
+                    projected = p0 + np.outer((seam_pts - p0) @ line_dir, line_dir)
+                    path = _extract_seam_path(projected, line_dir, p0, scene_diag)
+                elif agrees:
+                    # Clip the infinite line to where the wall actually stands.
+                    tl = np.sort((contact[0][[0, -1]] - p0) @ line_dir)
+                    path = p0 + np.outer(tl, line_dir)
+                else:
+                    path = None
+                if path is not None:
+                    return (path[0], path[-1],
                             f't-joint:plane-intersection,'
-                            f'p1={plane1_count},p2={plane2_count},seam={len(seam_pts)}')
+                            f'p1={plane1_count},p2={plane2_count},'
+                            f'seam={len(seam_pts)},wp={len(path)}',
+                            path)
+
+    # ── Fillet strategy: trace where the standing workpiece MEETS the table ──
+    # Only reached when there is no valid t-joint ridge. Take the workpiece's
+    # BASE BAND (points just above the table), drop it onto the table plane,
+    # and extract the ordered path through it. Unlike a plane∩plane
+    # intersection this follows a CURVED plate's bend, because the per-bin
+    # medians track wherever the base band actually runs. Skipped for flat
+    # lap/groove parts (dominant plane ≈ parallel to table) → groove path.
+    if joint_mode == "base" and table_n is not None and table_d is not None:
+        tn = np.asarray(table_n, np.float64)
+        tnn = float(np.linalg.norm(tn))
+        if tnn > 1e-9:
+            tn = tn / tnn
+        if abs(float(n1 @ tn)) < 0.85:               # workpiece stands upright
+            signed_t = workpiece_pts @ tn + float(table_d)
+            band = workpiece_pts[np.abs(signed_t) < thresh * 8]   # low, near the table
+            if len(band) >= 10:
+                base = band - np.outer(band @ tn + float(table_d), tn)
+                c0 = base.mean(axis=0)
+                _, _, vt = np.linalg.svd(base - c0, full_matrices=False)
+                path = _extract_seam_path(base, vt[0], c0, scene_diag)
+                if path is not None:
+                    return (path[0], path[-1],
+                            f'fillet:base-band,band={len(band)},wp={len(path)}',
+                            path)
+
+    if joint_mode == "base":
+        return None, None, "failed:no-supported-base-contact", None
+
+    if contact is not None:
+        cpath, cinfo = contact
+        if contact_straight is not None:
+            c, u, ts, dev90 = contact_straight
+            line = c + np.outer(ts, u)
+            return (line[0], line[-1],
+                    f'straight-joint:contact-trace,{cinfo},p1={plane1_count},'
+                    f'dev90={dev90:.4f},wp=2', line)
+        return (cpath[0], cpath[-1],
+                f'curved-joint:contact-trace,{cinfo},p1={plane1_count},wp={len(cpath)}',
+                cpath)
 
     # Groove path: ridge points = workpiece points significantly off plane1
     signed = workpiece_pts @ n1 + d1
     ridge_mask = np.abs(signed) > thresh * 1.5
     ridge_pts = workpiece_pts[ridge_mask]
     if len(ridge_pts) < 10:
-        ridge_pts = workpiece_pts
-    s, e, _axis = _fit_line_endpoints(ridge_pts, trim_pct=0.05)
+        return None, None, 'failed:no-ridge', None
+    s, e, axis = _fit_line_endpoints(ridge_pts, trim_pct=0.05)
     if s is None:
-        return None, None, 'failed:groove-pca'
-    return s, e, (f'groove:ridge-pca,'
-                  f'plane={plane1_count},ridge={len(ridge_pts)}')
+        return None, None, 'failed:groove-pca', None
+    path = _extract_seam_path(ridge_pts.astype(np.float64), axis,
+                              ridge_pts.mean(axis=0), scene_diag)
+    if path is None:
+        return None, None, 'failed:unsupported-ridge', None
+    return (path[0], path[-1],
+            f'groove:ridge-pca,plane={plane1_count},'
+            f'ridge={len(ridge_pts)},wp={len(path)}',
+            path)
 
 
 def _vggt_to_metric_scale(vggt_depth_v, metric_depth_v, mask_uint8,
@@ -507,8 +1235,7 @@ def _vggt_to_metric_scale(vggt_depth_v, metric_depth_v, mask_uint8,
     # Resize Metric3D depth to VGGT-native (H, W) so we can index by mask
     H, W = vggt_depth_v.shape
     if metric_depth_v.shape != (H, W):
-        metric_depth_v = cv2.resize(metric_depth_v, (W, H),
-                                    interpolation=cv2.INTER_LINEAR)
+        metric_depth_v = align_depth(metric_depth_v, (H, W))
     ys, xs = np.where(mask_uint8 > 0)
     if len(ys) == 0:
         ys, xs = np.where(vggt_depth_v > 0)
@@ -533,7 +1260,23 @@ def _get_vggt(device):
         if _VGGT_MODEL is not None and _VGGT_LOAD_DEVICE == device:
             return _VGGT_MODEL, False
         from vggt.models.vggt import VGGT
-        m = VGGT.from_pretrained('facebook/VGGT-1B').to(device)
+        m = None
+        if str(device).startswith('cuda'):
+            # Build the 1B-param model and map its weights straight onto the
+            # GPU. The default path first allocates ~5 GB of CPU RAM and then
+            # maps the 5 GB weight file, which can exceed the Windows commit
+            # limit ("paging file is too small", os error 1455).
+            try:
+                with torch.device(device):
+                    m = VGGT.from_pretrained('facebook/VGGT-1B',
+                                             map_location=str(device))
+            except (TypeError, AttributeError, RuntimeError):
+                m = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        if m is None:
+            m = VGGT.from_pretrained('facebook/VGGT-1B')
+        m = m.to(device)
         m.eval()
         _VGGT_MODEL, _VGGT_LOAD_DEVICE = m, device
         return _VGGT_MODEL, True
@@ -545,7 +1288,7 @@ def _get_metric3d_cached(device):
         if _M3D_LOAD_DEVICE == device:
             # Cached value may legitimately be None (load failed once).
             return _M3D_MODEL, False
-        _M3D_MODEL       = _load_metric3d(device)
+        _M3D_MODEL       = _load_metric3d(device, M3D_VARIANT)
         _M3D_LOAD_DEVICE = device
         return _M3D_MODEL, True
 
@@ -575,11 +1318,14 @@ def run_pipeline(job_id, image_paths, workdir):
                               'msg': ('Loading VGGT-1B…' if vggt_loaded
                                       else 'VGGT-1B ready (cached)')})
 
-        # 3 — Metric3D v2 (cached after first request)
-        m3d, m3d_loaded = _get_metric3d_cached(device)
+        # 3 — Metric3D is loaded lazily, AFTER hole detection, and only when it
+        # can actually help (no holes, or holes present but not yet calibrated).
+        # This skips the model entirely on the common fast path (fixture in
+        # frame + saved calibration).
+        m3d = None
+        m3d_skipped_reason = None
         _emit(q, 'progress', {'step': 3, 'total': 7,
-                              'msg': ('Loading Metric3D v2…' if m3d_loaded
-                                      else 'Metric3D v2 ready (cached)')})
+                              'msg': 'Metric3D: deferred (loads only if needed)'})
 
         # 4 — VGGT reconstruction
         _emit(q, 'progress', {'step': 4, 'total': 7,
@@ -604,10 +1350,26 @@ def run_pipeline(job_id, image_paths, workdir):
         vggt_depth = preds.get('depth', None)
         if vggt_depth is not None:
             vggt_depth = vggt_depth.cpu().numpy()
-            while vggt_depth.ndim > 3: vggt_depth = vggt_depth[0]  # (V, H, W)
+            vggt_depth = depth_views(vggt_depth, wp.shape[0])
 
         V = wp.shape[0]
         CONF_THRESH = 1.0
+
+        # 4a — Fit the fixture table once and crop the scene to it. The same
+        # table frame drives the PLY crop, workpiece/seam detection, and the
+        # viewer's "up" alignment (view_align). Falls back to full scene if no
+        # dominant plane is found.
+        flat_wp  = wp.reshape(-1, 3)
+        flat_wpc = wpc.reshape(-1) if wpc is not None else None
+        table = (_fit_table(flat_wp, flat_wpc, CONF_THRESH)
+                 if CROP_TO_TABLE else None)
+        scene_keep = _scene_crop_mask(flat_wp, table) if table is not None else None
+        if scene_keep is not None and int(scene_keep.sum()) < 500:
+            scene_keep = None     # crop too aggressive → fall back to full scene
+        if scene_keep is not None:
+            _emit(q, 'progress', {'step': 4, 'total': 7,
+                                  'msg': f'Cropped scene to table footprint: '
+                                         f'{int(scene_keep.sum()):,} pts kept'})
 
         # 4b — Fixture-hole detection (per view) → absolute scale
         _emit(q, 'progress', {'step': 4, 'total': 7,
@@ -659,6 +1421,8 @@ def run_pipeline(job_id, image_paths, workdir):
         if wpc is not None:
             keep &= wpc.reshape(-1) > PLY_CONF_THRESH
         n_conf = int(keep.sum())
+        if scene_keep is not None:                # crop to table + on-table object
+            keep &= scene_keep
 
         flat_pts  = flat_pts[keep]
         flat_cols = flat_cols[keep]
@@ -702,10 +1466,34 @@ def run_pipeline(job_id, image_paths, workdir):
         per_frame  = []
         scale_samples = []   # Metric3D fallback samples
 
-        flat_pts3d = wp.reshape(-1, 3)
-        flat_conf  = wpc.reshape(-1) if wpc is not None else None
-        table_n, table_d, workpiece_pts, scene_diag = _segment_workpiece(
-            flat_pts3d, conf=flat_conf, conf_thresh=CONF_THRESH)
+        if table is not None and scene_keep is not None:
+            # Reuse the cropped table frame: the workpiece is the on-table
+            # object(s) above the surface — the floating torch is already gone
+            # from scene_keep, so the seam can't latch onto background.
+            table_n, table_d, scene_diag = table['n'], table['d'], table['scene_diag']
+            valid = ~np.all(flat_wp == 0, axis=1)
+            if flat_wpc is not None:
+                valid &= flat_wpc > CONF_THRESH
+            signed_all = flat_wp @ table_n + table_d
+            wp_mask = valid & scene_keep & (signed_all > table['part_cut'])
+            workpiece_pts = flat_wp[wp_mask].astype(np.float64)
+            # Depth-prominence filter: only clusters that genuinely RISE off
+            # the table are workpiece. Rust/brightness artefacts in the VGGT
+            # depth (a few mm of bump) get dropped here, so the seam can only
+            # attach to real geometric edges.
+            tall = _tall_cluster_mask(workpiece_pts,
+                                      signed_all[wp_mask].astype(np.float64),
+                                      table)
+            n_dropped = int(len(workpiece_pts) - tall.sum())
+            workpiece_pts = workpiece_pts[tall]
+            if n_dropped:
+                _emit(q, 'progress', {'step': 6, 'total': 7,
+                                      'msg': f'Dropped {n_dropped:,} low-prominence '
+                                             f'pts (rust/noise bumps)'})
+        else:
+            # No table fit (or crop disabled) → legacy footprint segmentation.
+            table_n, table_d, workpiece_pts, scene_diag = _segment_workpiece(
+                flat_wp, conf=flat_wpc, conf_thresh=CONF_THRESH)
 
         _emit(q, 'progress', {'step': 6, 'total': 7,
                               'msg': f'Workpiece: {len(workpiece_pts):,} pts '
@@ -713,47 +1501,67 @@ def run_pipeline(job_id, image_paths, workdir):
 
         detect_method = 'none'
         weld_s_w = weld_e_w = None
-        if table_n is not None and len(workpiece_pts) >= 50:
+        weld_path_w = None                 # ordered (N,3) waypoints, N>=2
+        if len(workpiece_pts) >= 50:
             _emit(q, 'progress', {'step': 6, 'total': 7,
-                                  'msg': 'Geometric seam (plane intersection / ridge PCA)…'})
-            weld_s_w, weld_e_w, detect_method = _detect_seam_geometric(
-                workpiece_pts, scene_diag)
+                                  'msg': 'Geometric seam (contact trace / plane intersection / ridge)…'})
+            weld_s_w, weld_e_w, detect_method, weld_path_w = _detect_seam_geometric(
+                workpiece_pts, scene_diag, table_n=table_n, table_d=table_d,
+                joint_mode=JOBS[job_id].get("joint_mode", "auto"))
+            # Keep the detector's exact input so detection can be re-run and
+            # debugged later without repeating the reconstruction.
+            try:
+                np.savez_compressed(
+                    os.path.join(workdir, 'geometry.npz'),
+                    part=np.asarray(workpiece_pts, np.float32),
+                    diag=float(scene_diag),
+                    table_n=(np.asarray(table_n, float) if table_n is not None
+                             else np.full(3, np.nan)),
+                    table_d=(float(table_d) if table_d is not None else np.nan))
+            except Exception:
+                pass
 
-        # Fallback: per-view 2-D mask → world-frame PCA (option-#1 path)
-        if weld_s_w is None:
+        # Decide whether to run Metric3D this job. In 'metric3d+holes' mode it
+        # supplies the headline scale, so it runs every time. In 'holes' mode it
+        # runs only when there are no holes (fast path). Loaded lazily.
+        need_metric3d = (MEASUREMENT_SCALE == 'metric3d+holes') or (
+            hole_scale_factor is None)
+        m3d_skipped_holes = (not need_metric3d) and (hole_scale_factor is not None)
+        if need_metric3d and vggt_depth is not None:
+            m3d, m3d_loaded = _get_metric3d_cached(device)
             _emit(q, 'progress', {'step': 6, 'total': 7,
-                                  'msg': 'Geometric failed — falling back to 2-D mask fusion…'})
-            seam_world = []
-            for i in range(V):
-                rgb_v  = (colors[i] * 255).clip(0, 255).astype(np.uint8)
-                mask_v = _seam_mask_2d(rgb_v)
-                ys, xs = np.where(mask_v > 0)
-                if not len(ys):
-                    continue
-                pts_v = wp[i, ys, xs]
-                if wpc is not None:
-                    keep = (wpc[i, ys, xs] > CONF_THRESH) & ~np.all(pts_v == 0, axis=1)
-                else:
-                    keep = ~np.all(pts_v == 0, axis=1)
-                pts_v = pts_v[keep]
-                if len(pts_v):
-                    seam_world.append(pts_v.astype(np.float64))
-            all_pts = (np.concatenate(seam_world, axis=0)
-                       if seam_world else np.zeros((0, 3), np.float64))
-            weld_s_w, weld_e_w, _ax = _fit_line_endpoints(all_pts, trim_pct=0.05)
-            if weld_s_w is not None:
-                detect_method = f'fallback:2d-mask,seam_pts={len(all_pts)}'
+                                  'msg': ('Loading Metric3D ('
+                                          + M3D_VARIANT + ')…' if m3d_loaded
+                                          else 'Metric3D ready (cached)')})
+        else:
+            m3d_skipped_reason = ('holes used (Metric3D off for speed)'
+                                  if m3d_skipped_holes else 'no depth output')
+            _emit(q, 'progress', {'step': 6, 'total': 7,
+                                  'msg': f'Metric3D skipped — {m3d_skipped_reason}'})
 
         # Per-view Metric3D scale samples (independent of detection method)
+        # Focal for Metric3D: explicit intrinsics > user FOV (hfov_deg) > guess.
+        manual_intr = JOBS[job_id].get('intrinsics')
+        hfov_deg    = JOBS[job_id].get('hfov_deg')
+        focal_norm  = (1.0 / (2.0 * np.tan(np.radians(float(hfov_deg)) / 2.0))
+                       if hfov_deg else None)
+        # Restrict the VGGT↔Metric3D comparison to the cropped table+part region
+        # (where both reconstruct reliably) instead of the whole image.
+        scene_keep_vhw = (scene_keep.reshape(V, H, W)
+                          if scene_keep is not None else None)
         if m3d is not None and vggt_depth is not None:
             for i, img_path in enumerate(image_paths):
                 _emit(q, 'progress', {'step': 6, 'total': 7,
                                       'msg': f'Metric3D scale {i+1}/{V}…'})
                 m_depth, _ = _run_metric3d(m3d, img_path, device,
-                                           intrinsics=JOBS[job_id].get('intrinsics'))
-                # Use the whole image (not seam mask) for a stable scale estimate
-                full_mask = np.ones(vggt_depth[i].shape, np.uint8) * 255
-                s, n = _vggt_to_metric_scale(vggt_depth[i], m_depth, full_mask,
+                                           intrinsics=manual_intr,
+                                           focal_norm=focal_norm)
+                if (scene_keep_vhw is not None
+                        and scene_keep_vhw[i].shape == vggt_depth[i].shape):
+                    mask_i = (scene_keep_vhw[i] > 0).astype(np.uint8) * 255
+                else:
+                    mask_i = np.ones(vggt_depth[i].shape, np.uint8) * 255
+                s, n = _vggt_to_metric_scale(vggt_depth[i], m_depth, mask_i,
                                              conf_v=wpc[i] if wpc is not None else None,
                                              conf_thresh=CONF_THRESH)
                 if s is not None:
@@ -767,32 +1575,59 @@ def run_pipeline(job_id, image_paths, workdir):
             for i, img_path in enumerate(image_paths):
                 per_frame.append({'image': os.path.basename(img_path)})
 
-        if weld_s_w is None:
-            # Ultimate fallback: depth extremes (preserves prior behaviour)
-            flat_all = wp.reshape(-1, 3)
-            if wpc is not None:
-                hi = (wpc.reshape(-1) > CONF_THRESH) & ~np.all(flat_all == 0, axis=1)
-                flat_all = flat_all[hi]
-            if len(flat_all):
-                weld_s_w = flat_all[np.argmin(flat_all[:, 2])]
-                weld_e_w = flat_all[np.argmax(flat_all[:, 2])]
-                detect_method = 'fallback:depth-extremes'
-            else:
-                weld_s_w = weld_e_w = np.zeros(3)
-                detect_method = 'fallback:empty'
+        detected = weld_path_w is not None and len(weld_path_w) >= 2
+        if not detected:
+            weld_path_w = np.empty((0, 3), dtype=float)
+            detect_method = 'needs-selection: no supported narrow seam found'
 
-        seam_len_vggt = float(np.linalg.norm(weld_e_w - weld_s_w))
+        # Seam length = ARC length along the waypoint path. For a straight
+        # (2-point) path this equals the start–end distance; for a curvy seam
+        # it is the true weld length (the chord would under-measure it).
+        seam_len_vggt = _path_arc_length(weld_path_w)
 
-        # Absolute-scale factor: holes (preferred) > Metric3D depth-ratio
-        metric3d_scale = None
+        # Metric3D raw scale (sample-weighted median across views).
+        metric3d_scale_raw = None
         if scale_samples:
             arr = np.array(scale_samples)            # (K, 2): scale, n_used
             order = np.argsort(arr[:, 0])
             sorted_s = arr[order, 0]; sorted_n = arr[order, 1]
             cum = np.cumsum(sorted_n)
-            metric3d_scale = float(sorted_s[np.searchsorted(cum, cum[-1] / 2.0)])
+            metric3d_scale_raw = float(sorted_s[np.searchsorted(cum, cum[-1] / 2.0)])
 
-        if hole_scale_factor is not None:
+        # Anchor Metric3D to the holes. When the holes are present they're ground
+        # truth, so Metric3D's scale snaps to them (and we remember the
+        # correction for off-fixture use). With no holes, Metric3D — corrected by
+        # any saved calibration — carries the scale on its own.
+        metric3d_scale     = None
+        metric3d_calibrated = False
+        metric3d_correction = None
+        if metric3d_scale_raw is not None and metric3d_scale_raw > 1e-12:
+            if hole_scale_factor is not None:
+                corr = hole_scale_factor / metric3d_scale_raw
+                if np.isfinite(corr) and corr > 0:
+                    _save_m3d_calib(corr)
+                    metric3d_correction = corr
+                metric3d_scale = hole_scale_factor           # anchored to holes
+                metric3d_calibrated = True
+            elif _M3D_CORRECTION is not None:
+                metric3d_correction = _M3D_CORRECTION
+                metric3d_scale = metric3d_scale_raw * _M3D_CORRECTION
+                metric3d_calibrated = True
+            else:
+                metric3d_scale = metric3d_scale_raw          # raw (no anchor yet)
+        elif m3d_skipped_holes:
+            metric3d_scale = hole_scale_factor
+            metric3d_correction = _M3D_CORRECTION
+            metric3d_calibrated = _M3D_CORRECTION is not None
+
+        # Headline scale + source. In 'metric3d+holes' mode the headline is the
+        # (holes-anchored) Metric3D scale; we fall back to holes only if Metric3D
+        # is unavailable, then to nothing.
+        if MEASUREMENT_SCALE == 'metric3d+holes' and metric3d_scale is not None:
+            scale_factor = metric3d_scale
+            scale_source = ('metric3d+holes' if hole_scale_factor is not None
+                            else 'metric3d')
+        elif hole_scale_factor is not None:
             scale_factor = hole_scale_factor
             scale_source = 'holes'
         elif metric3d_scale is not None:
@@ -804,6 +1639,10 @@ def run_pipeline(job_id, image_paths, workdir):
 
         seam_len_m = (seam_len_vggt * scale_factor) if scale_factor else None
 
+        # Metric3D as an INDEPENDENT measurement (shown in its own UI panel).
+        seam_mm_metric3d = (seam_len_vggt * metric3d_scale * 1000.0
+                            if metric3d_scale and detected else None)
+
         # Table coordinate frame (origin + axes) from detected hole lattice.
         table_frame = None
         if hole_scale_factor and table_n is not None and len(holes_world_all) >= 4:
@@ -813,10 +1652,15 @@ def run_pipeline(job_id, image_paths, workdir):
         # Keep weld_start/end in raw VGGT units so they live in the same
         # coordinate frame as the PLY the viewer renders. Metric and table
         # frame versions go in separate fields.
-        s_out   = weld_s_w.tolist()
-        e_out   = weld_e_w.tolist()
-        s_out_m = (weld_s_w * scale_factor).tolist() if scale_factor else None
-        e_out_m = (weld_e_w * scale_factor).tolist() if scale_factor else None
+        s_out   = weld_s_w.tolist() if detected else None
+        e_out   = weld_e_w.tolist() if detected else None
+        s_out_m = (weld_s_w * scale_factor).tolist() if scale_factor and detected else None
+        e_out_m = (weld_e_w * scale_factor).tolist() if scale_factor and detected else None
+
+        # Viewer "up" hint: 3×3 rotation that stands the table level so the
+        # front-end turntable spins horizontally about the table's true
+        # vertical. Pure render hint — does not alter weld_start/end or the PLY.
+        view_align = _view_align_matrix(table) if table is not None else None
 
         # Also project endpoints into the table frame when available.
         weld_start_table = weld_end_table = None
@@ -829,18 +1673,36 @@ def run_pipeline(job_id, image_paths, workdir):
 
         result = {
             'ply_ready':      True,
+            'detection_status': 'candidate' if detected else 'needs_selection',
             'point_count':    n_pts,
             'per_frame':      per_frame,
             # Cloud-frame (raw VGGT units) — matches the PLY served to the viewer.
             'weld_start':     s_out,
             'weld_end':       e_out,
+            # Ordered waypoint path (N>=2; N=2 means straight). Same frame as
+            # weld_start/end; weld_path_m is the metres version (null unscaled).
+            'weld_path':      weld_path_w.tolist(),
+            'weld_path_m':    ((weld_path_w * scale_factor).tolist()
+                               if scale_factor else None),
+            'waypoint_count': int(len(weld_path_w)),
+            'is_curved':      bool(len(weld_path_w) > 2),
             # Metric (world axes) versions — null if no scale factor.
             'weld_start_m':   s_out_m,
             'weld_end_m':     e_out_m,
-            'seam_length_m':  (seam_len_m if seam_len_m is not None else seam_len_vggt),
-            'seam_length_mm': ((seam_len_m if seam_len_m is not None
-                                else seam_len_vggt) * 1000),
+            'seam_length_m':  (seam_len_m if detected else None),
+            'seam_length_mm': (seam_len_m * 1000 if detected and seam_len_m is not None else None),
             'seam_length_vggt_units': seam_len_vggt,
+            # Independent Metric3D measurement (its own UI panel). null if the
+            # model didn't load or produced no usable scale samples this run.
+            'seam_length_mm_metric3d': seam_mm_metric3d,
+            'metric3d_available':      (m3d is not None or m3d_skipped_reason is not None),
+            'metric3d_skipped':        m3d_skipped_reason,    # null if it ran
+            'metric3d_scale_samples':  len(scale_samples),
+            'metric3d_calibrated':     metric3d_calibrated,
+            'metric3d_correction':     metric3d_correction,
+            'metric3d_calib_source':   ('holes' if (metric3d_calibrated and len(scale_samples) and hole_scale_factor is not None)
+                                        else 'saved' if metric3d_calibrated
+                                        else 'uncalibrated'),
             'scale_factor':   scale_factor,
             'scale_source':   scale_source,         # 'holes' | 'metric3d' | None
             'hole_scale_factor':    hole_scale_factor,
@@ -852,6 +1714,7 @@ def run_pipeline(job_id, image_paths, workdir):
             'table_frame':       table_frame,        # null if not enough holes
             'weld_start_table_m': weld_start_table,  # null if no table_frame
             'weld_end_table_m':   weld_end_table,
+            'view_align':        view_align,          # 3×3 render hint, null if no table
         }
         avg_len = seam_len_m if seam_len_m is not None else seam_len_vggt
         with open(os.path.join(workdir, 'weld_result.json'), 'w') as f:
@@ -861,6 +1724,8 @@ def run_pipeline(job_id, image_paths, workdir):
         unit_msg = (f'Done — seam {avg_len*1000:.1f} mm' if scale_factor
                     else f'Done — seam {seam_len_vggt:.4f} VGGT units '
                          f'(no Metric3D scale)')
+        if not detected:
+            unit_msg = 'Reconstruction ready — select the joint with Draw Path'
         _emit(q, 'progress', {'step': 7, 'total': 7, 'msg': unit_msg})
         _emit(q, 'done', result)
 
@@ -876,6 +1741,12 @@ def run_pipeline(job_id, image_paths, workdir):
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')
+
+@app.route('/examples/<name>.json')
+def path_example(name):
+    if name not in ('straight', 'curved'):
+        return jsonify({'error': 'Unknown example'}), 404
+    return send_from_directory(os.path.join(app.root_path, 'examples'), name + '.json')
 
 @app.route('/reconstruct', methods=['POST'])
 def reconstruct():
@@ -905,9 +1776,22 @@ def reconstruct():
         except Exception:
             pass   # bad JSON → fall back to 70° HFOV guess
 
+    # Optional horizontal field-of-view (degrees) — simpler than full
+    # intrinsics; sets the Metric3D focal when intrinsics aren't supplied.
+    hfov_deg = None
+    hfov_raw = request.form.get('hfov_deg')
+    if hfov_raw:
+        try:
+            v = float(hfov_raw)
+            if 10.0 < v < 170.0:
+                hfov_deg = v
+        except Exception:
+            pass
+
     JOBS[job_id] = {'status': 'running', 'queue': queue.Queue(),
                     'result': None, 'workdir': workdir,
-                    'intrinsics': intrinsics}
+                    'intrinsics': intrinsics, 'hfov_deg': hfov_deg,
+                    'joint_mode': request.form.get('joint_mode', 'auto')}
     threading.Thread(target=run_pipeline,
                      args=(job_id, paths, workdir), daemon=True).start()
     return jsonify({'job_id': job_id})

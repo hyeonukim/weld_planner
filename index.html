@@ -277,6 +277,7 @@ canvas{display:block;width:100%;height:100%;}
   <div class="panel">
     <div class="plbl">Reconstruction Result</div>
     <div class="result-card" id="resultCard"></div>
+    <div class="result-card" id="metric3dCard"></div>
     <div class="btn-row" id="dlBtns" style="display:none">
       <button class="btn blue" onclick="downloadPLY()">↓ .ply</button>
       <button class="btn" onclick="downloadResult()">↓ JSON</button>
@@ -310,6 +311,13 @@ canvas{display:block;width:100%;height:100%;}
         <button class="btn green" onclick="startPicking('start')">Set Start</button>
         <button class="btn blue"  onclick="startPicking('end')">Set End</button>
       </div>
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn orange" onclick="startDrawPath()">✏ Draw Path</button>
+        <span id="drawBtns" style="display:none">
+          <button class="btn" onclick="undoDrawPoint()">↩ Undo</button>
+          <button class="btn green" onclick="finishDrawPath()">✓ Finish</button>
+        </span>
+      </div>
       <div class="play-bar">
         <div class="btn-row" style="margin-top:8px">
           <button class="btn orange" id="btnPlay" onclick="togglePlay()">▶ Play Weld</button>
@@ -320,27 +328,21 @@ canvas{display:block;width:100%;height:100%;}
       </div>
     </div>
 
+    <div class="btn-row" style="margin:10px 0">
+      <button class="btn" onclick="loadPathDemo('straight')">Straight demo</button>
+      <button class="btn" onclick="loadPathDemo('curved')">Curved demo</button>
+    </div>
+    <div style="color:var(--muted);font-size:10px">Synthetic path examples · no model download</div>
+    <label for="jointMode">Joint location</label>
+    <select id="jointMode" style="width:100%;margin:8px 0;padding:6px">
+      <option value="auto">Between workpiece surfaces (any orientation)</option>
+      <option value="base">Workpiece to fixture/base — explicit selection</option>
+    </select>
     <!-- Auto -->
     <div id="modeAuto" style="display:none">
-      <div class="detect-settings">
-        <div class="detect-row">
-          <label>Warm threshold</label>
-          <input type="range" id="warmThresh" min="5" max="60" value="20" step="5">
-          <div class="ctrl-val" id="warmThreshV">20</div>
-        </div>
-        <div class="detect-row">
-          <label>Min brightness</label>
-          <input type="range" id="brightMin" min="100" max="220" value="150" step="10">
-          <div class="ctrl-val" id="brightMinV">150</div>
-        </div>
-        <div class="detect-row">
-          <label>Trim outliers %</label>
-          <input type="range" id="trimPct" min="0" max="15" value="5" step="1">
-          <div class="ctrl-val" id="trimPctV">5</div>
-        </div>
-      </div>
+      <p>Restore the reconstructed straight or curved path. For imported clouds, select the joint using Draw Path.</p>
       <button class="detect-btn" onclick="autoDetect()">
-        <span>⚡</span><span>Run Auto-Detection</span>
+        <span>⚡</span><span>Restore Detected Path</span>
       </button>
       <div class="detect-result" id="detectResult"></div>
       <div class="btn-row">
@@ -367,7 +369,7 @@ canvas{display:block;width:100%;height:100%;}
     <div class="btn-row">
       <button class="btn active" id="btnAxes" onclick="toggleAxes()">Axes</button>
       <button class="btn" onclick="resetView()">Reset</button>
-      <button class="btn" onclick="fitView()">Fit</button>
+      <button class="btn" onclick="fitView()">Fit</button><button class="btn" onclick="focusJoint()">Focus Joint</button>
     </div>
   </div>
 
@@ -413,8 +415,13 @@ canvas{display:block;width:100%;height:100%;}
         <input id="inCy" type="number" placeholder="e.g. 1512" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
       </div>
     </div>
+    <div style="margin-top:8px">
+      <div style="font-size:10px;color:var(--muted);margin-bottom:3px">…or just Horizontal FOV (°) — easier for phone cameras</div>
+      <input id="inHfov" type="number" placeholder="e.g. 65" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:5px 7px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+    </div>
     <div style="font-size:10px;color:var(--muted);margin-top:6px">
-      Tip: run <code style="font-family:'DM Mono',monospace">exiftool image.jpg | grep Focal</code>
+      Tip: run <code style="font-family:'DM Mono',monospace">exiftool image.jpg | grep Focal</code>.
+      Metric3D also auto-calibrates from the 50&nbsp;mm fixture holes when they're in frame.
     </div>
   </div>
 
@@ -468,10 +475,14 @@ canvas{display:block;width:100%;height:100%;}
 // ══════════════════════════════════════════════════════════════
 let ptsBuf = null, bounds = null, loaded = false;
 let weldStart = null, weldEnd = null;
+// Ordered weld waypoints (cloud frame, Y-flipped like weldStart/End).
+// length 2 = straight seam; >2 = curvy. weldStart/End mirror the ends.
+let weldPath = null;
 let pickingMode = null, currentMode = 'manual';
 let playing = false, playT = 0, playRAF = null;
 let cam = { rotX:-0.55, rotY:0.0, zoom:1, panX:0, panY:0 };
 let drag = { on:false, right:false, lx:0, ly:0 };
+let viewAlign = null;   // 3×3 table-up render hint from the server (Part B)
 let showAxes = true;
 const MAX_RENDER = 120000;
 let renderStep = 1;
@@ -520,7 +531,8 @@ function handleFiles(files) {
   const imgFiles = [...files].filter(f => f.type.startsWith('image/'));
 
   if (plyFiles.length > 0) {
-    // Direct PLY load
+    // Direct PLY load — no server result, so drop any stale view alignment.
+    viewAlign = null; currentJobId = null;
     const r = new FileReader();
     r.onload = e => parsePLY(e.target.result);
     r.readAsArrayBuffer(plyFiles[0]);
@@ -570,6 +582,7 @@ async function runReconstruction() {
   document.getElementById('progFill').style.width = '0%';
 
   const form = new FormData();
+  form.append('joint_mode', document.getElementById('jointMode').value);
   uploadedImages.forEach(f => form.append('images', f));
 
   // Attach camera intrinsics if the user filled them in
@@ -580,6 +593,9 @@ async function runReconstruction() {
   if (fx && fy && cx && cy) {
     form.append('intrinsics', JSON.stringify({fx:+fx, fy:+fy, cx:+cx, cy:+cy}));
   }
+  // Optional horizontal FOV (used for Metric3D focal when no full intrinsics)
+  const hfov = document.getElementById('inHfov').value.trim();
+  if (hfov) form.append('hfov_deg', hfov);
 
   let jobId;
   try {
@@ -648,11 +664,28 @@ async function onReconstructionDone(jobId, result) {
   currentScale       = result.scale_factor || 1.0;
   currentScaleSource = result.scale_source || null;
   currentResult      = result;     // table_frame consumed by draw() gizmo
+  // table-up render hint. view_align is in server WORLD coords, but the cloud is
+  // rendered in the display frame (Y negated in onLoaded). Negate the Y column
+  // so the rotation composes correctly with that flip.
+  viewAlign = result.view_align
+    ? result.view_align.map(r => [r[0], -r[1], r[2]])
+    : null;
 
   // ── Show result card ──
   // The server's weld_start_m is in metres (world axes, no Y-flip).
   // Fall back to weld_start (VGGT units) if no scale was recovered.
-  const slmm = result.seam_length_mm;
+  const slmm = result.scale_factor ? result.seam_length_mm : result.seam_length_vggt_units;
+  if (!result.weld_start || !result.weld_end) {
+    clearAllPoints();
+    document.getElementById("resultCard").classList.add("visible");
+    document.getElementById("resultCard").textContent = "No supported seam found. Use Manual Pick → Draw Path to trace the joint on the cloud.";
+    document.getElementById("dlBtns").style.display = "";
+    document.getElementById("procOverlay").classList.remove("visible");
+    document.getElementById("runBtn").disabled = false;
+    setStatus("Select joint");
+    draw();
+    return;
+  }
   const sm   = result.weld_start_m || result.weld_start;
   const em   = result.weld_end_m   || result.weld_end;
   const unit = result.scale_factor ? 'mm' : 'units';
@@ -660,16 +693,35 @@ async function onReconstructionDone(jobId, result) {
     ? v => (v * 100).toFixed(2) + 'cm'
     : v => v.toFixed(4) + 'u';
 
+  // Primary card: VGGT geometry scaled by Metric3D (anchored to the holes).
+  const scaleLabels = {'metric3d+holes':'Metric3D + holes', 'metric3d':'Metric3D', 'holes':'holes'};
+  const scaleLbl = scaleLabels[currentScaleSource] || currentScaleSource;
   document.getElementById('resultCard').classList.add('visible');
   document.getElementById('resultCard').innerHTML =
-    `<div class="rc-head">Seam detected</div>` +
+    `<div class="rc-head">Seam candidate — inspect path</div>` +
     `Length &nbsp;<span class="rc-hi">${slmm.toFixed(1)} ${unit}</span>` +
-    (currentScaleSource ? ` <span style="color:var(--muted);font-size:10px">(scale: ${currentScaleSource})</span>` : '') + `<br>` +
+    (currentScaleSource ? ` <span style="color:var(--muted);font-size:10px">(scale: ${scaleLbl})</span>` : '') + `<br>` +
     `Points &nbsp;<span class="rc-val">${result.point_count.toLocaleString()}</span><br>` +
     `<br><span class="rc-start">▸ Start</span><br>` +
     `&nbsp;x <span class="rc-val">${fmtCoord(sm[0])}</span> y <span class="rc-val">${fmtCoord(sm[1])}</span> z <span class="rc-val">${fmtCoord(sm[2])}</span><br>` +
     `<span class="rc-end">▸ End</span><br>` +
     `&nbsp;x <span class="rc-val">${fmtCoord(em[0])}</span> y <span class="rc-val">${fmtCoord(em[1])}</span> z <span class="rc-val">${fmtCoord(em[2])}</span>`;
+
+  // The headline above IS the Metric3D + holes measurement now, so the separate
+  // Metric3D panel is redundant — keep it hidden. Show one note about scale
+  // provenance when Metric3D supplied it on its own (off-fixture).
+  const m3dCard = document.getElementById('metric3dCard');
+  if (currentScaleSource === 'metric3d' && result.metric3d_calib_source !== 'holes') {
+    const note = result.metric3d_calib_source === 'saved'
+      ? `using saved calibration (×${(result.metric3d_correction||1).toFixed(3)})`
+      : `uncalibrated — no fixture holes this shot`;
+    m3dCard.classList.add('visible');
+    m3dCard.innerHTML = `<div class="rc-head">Scale note</div>` +
+      `<span style="color:var(--muted);font-size:11px">Metric3D set the scale (${note}).</span>`;
+  } else {
+    m3dCard.classList.remove('visible');
+    m3dCard.innerHTML = '';
+  }
 
   document.getElementById('dlBtns').style.display = '';
 
@@ -679,6 +731,11 @@ async function onReconstructionDone(jobId, result) {
   const s = result.weld_start, e = result.weld_end;
   weldStart = { x: s[0], y: -s[1], z: s[2] };
   weldEnd   = { x: e[0], y: -e[1], z: e[2] };
+  // Full waypoint path (curvy seams have >2 points); Y-flip like the markers.
+  weldPath = (result.weld_path && result.weld_path.length >= 2)
+    ? result.weld_path.map(p => ({ x: p[0], y: -p[1], z: p[2] }))
+    : [weldStart, weldEnd];
+  if (result.is_curved) toast(`Curved seam: ${result.waypoint_count} waypoints`);
   setPointDisplay('start', weldStart);
   setPointDisplay('end',   weldEnd);
   updateWeldCoords();
@@ -688,7 +745,7 @@ async function onReconstructionDone(jobId, result) {
   document.getElementById('procOverlay').classList.remove('visible');
   document.getElementById('runBtn').disabled = false;
   setStatus('Done');
-  toast(`Reconstruction done — ${slmm.toFixed(1)} mm seam`);
+  toast(`Reconstruction done — ${slmm.toFixed(1)} ${unit} seam`);
   updateProgress(7, 7, 'Done ✓');
 }
 
@@ -808,6 +865,11 @@ function parsePLY(buf) {
 }
 
 function onLoaded() {
+  stopPlay(); clearAllPoints();
+  document.getElementById('resultCard').classList.remove('visible');
+  document.getElementById('metric3dCard').classList.remove('visible');
+  document.getElementById('dlBtns').style.display='none';
+  currentResult = null; currentScale = 1; currentScaleSource = null; viewAlign = null;
   const N = ptsBuf.length / 6;
 
   // VGGT outputs Y-down (camera convention). Flip Y so the cloud
@@ -849,7 +911,16 @@ function onLoaded() {
 // ══════════════════════════════════════════════════════════════
 function project(x, y, z) {
   const b = bounds;
-  const nx=(x-b.cx)/b.scale, ny=(y-b.cy)/b.scale, nz=(z-b.cz)/b.scale;
+  let nx=(x-b.cx)/b.scale, ny=(y-b.cy)/b.scale, nz=(z-b.cz)/b.scale;
+  // Stand the table level first (server's view_align), so a horizontal drag
+  // spins about the table's true vertical instead of the raw VGGT axis.
+  if (viewAlign){
+    const R=viewAlign;
+    const ax=R[0][0]*nx+R[0][1]*ny+R[0][2]*nz;
+    const ay=R[1][0]*nx+R[1][1]*ny+R[1][2]*nz;
+    const az=R[2][0]*nx+R[2][1]*ny+R[2][2]*nz;
+    nx=ax; ny=ay; nz=az;
+  }
   const cosY=Math.cos(cam.rotY), sinY=Math.sin(cam.rotY);
   const rx=nx*cosY-nz*sinY, rz=nx*sinY+nz*cosY;
   const cosX=Math.cos(cam.rotX), sinX=Math.sin(cam.rotX);
@@ -880,7 +951,7 @@ function draw() {
     const tf   = currentResult && currentResult.table_frame;
 
     let origin, axes;
-    if (tf && currentScale !== 1.0) {
+    if (tf && !!currentScaleSource) {
       // ── Table frame from detected hole grid ──
       // origin_m is in metres (world axes); divide by scale to enter VGGT
       // cloud units, then negate Y to match the cloud's display Y-flip.
@@ -922,21 +993,52 @@ function draw() {
   if (weldStart) drawMarker(weldStart,'#3ddc84','S',true);
   if (weldEnd)   drawMarker(weldEnd,  '#5aa8ff','E',false);
 
-  if (weldStart && weldEnd) {
-    const ps=project(weldStart.x,weldStart.y,weldStart.z);
-    const pe=project(weldEnd.x,  weldEnd.y,  weldEnd.z);
-    ctx.beginPath(); ctx.moveTo(ps.sx,ps.sy); ctx.lineTo(pe.sx,pe.sy);
-    ctx.strokeStyle='rgba(255,255,255,0.14)';
-    ctx.lineWidth=1.5*devicePixelRatio;
-    ctx.setLineDash([4*devicePixelRatio,4*devicePixelRatio]);
+  const path = activePath();
+  if (path) {
+    // Full path (dashed) — polyline through every waypoint.
+    ctx.beginPath();
+    const p0 = project(path[0].x, path[0].y, path[0].z);
+    ctx.moveTo(p0.sx, p0.sy);
+    for (let i = 1; i < path.length; i++) {
+      const p = project(path[i].x, path[i].y, path[i].z);
+      ctx.lineTo(p.sx, p.sy);
+    }
+    ctx.strokeStyle='#ff8b42';
+    ctx.lineWidth=3*devicePixelRatio;
+    ctx.setLineDash([]);
     ctx.stroke(); ctx.setLineDash([]);
 
+    // Waypoint dots on curved paths (skip the endpoints — S/E markers cover them)
+    if (path.length > 2) {
+      ctx.fillStyle='#ffd5a8';
+      for (let i = 1; i < path.length - 1; i++) {
+        const p = project(path[i].x, path[i].y, path[i].z);
+        ctx.beginPath(); ctx.arc(p.sx, p.sy, 1.6*devicePixelRatio, 0, Math.PI*2); ctx.fill();
+      }
+    }
+
     if (playing || playT > 0) {
-      const tx=weldStart.x+(weldEnd.x-weldStart.x)*playT;
-      const ty=weldStart.y+(weldEnd.y-weldStart.y)*playT;
-      const tz=weldStart.z+(weldEnd.z-weldStart.z)*playT;
-      const pp=project(tx,ty,tz);
-      ctx.beginPath(); ctx.moveTo(ps.sx,ps.sy); ctx.lineTo(pp.sx,pp.sy);
+      // Welded portion (solid) up to the torch, following the curve.
+      const torch = pathPointAt(path, playT);
+      ctx.beginPath(); ctx.moveTo(p0.sx, p0.sy);
+      const totalT = playT;
+      // walk segments until we reach the torch fraction
+      let acc = 0, total = 0;
+      for (let i = 1; i < path.length; i++) {
+        const dx=path[i].x-path[i-1].x, dy=path[i].y-path[i-1].y, dz=path[i].z-path[i-1].z;
+        total += Math.sqrt(dx*dx+dy*dy+dz*dz);
+      }
+      for (let i = 1; i < path.length && total > 0; i++) {
+        const dx=path[i].x-path[i-1].x, dy=path[i].y-path[i-1].y, dz=path[i].z-path[i-1].z;
+        const l = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if ((acc + l) / total <= totalT) {
+          const p = project(path[i].x, path[i].y, path[i].z);
+          ctx.lineTo(p.sx, p.sy);
+          acc += l;
+        } else break;
+      }
+      const pp = project(torch.x, torch.y, torch.z);
+      ctx.lineTo(pp.sx, pp.sy);
       ctx.strokeStyle='#f07040'; ctx.lineWidth=3*devicePixelRatio; ctx.stroke();
       const gr=ctx.createRadialGradient(pp.sx,pp.sy,0,pp.sx,pp.sy,18*devicePixelRatio);
       gr.addColorStop(0,'rgba(255,230,80,.95)'); gr.addColorStop(.25,'rgba(255,140,40,.6)');
@@ -1011,8 +1113,15 @@ canvas.addEventListener('click', e=>{
   }
   if (minD<22*devicePixelRatio){
     const coord={x:bx,y:by,z:bz};
-    if      (pickingMode==='start'){weldStart=coord;setPointDisplay('start',coord);pickingMode='end';updatePickingUI();toast('Start set — now pick end');}
-    else if (pickingMode==='end')  {weldEnd=coord;setPointDisplay('end',coord);pickingMode=null;updatePickingUI();updateWeldCoords();wrap.classList.remove('pick-start','pick-end');toast('End set ✓');}
+    if      (pickingMode==='start'){weldStart=coord;weldPath=null;setPointDisplay('start',coord);pickingMode='end';updatePickingUI();toast('Start set — now pick end');}
+    else if (pickingMode==='end')  {weldEnd=coord;weldPath=(weldStart?[weldStart,coord]:null);setPointDisplay('end',coord);pickingMode=null;updatePickingUI();updateWeldCoords();wrap.classList.remove('pick-start','pick-end');toast('End set ✓');}
+    else if (pickingMode==='draw') {
+      weldPath.push(coord);
+      if (weldPath.length===1){weldStart=coord;setPointDisplay('start',coord);}
+      weldEnd=coord;
+      updatePickingUI();
+      toast(`Waypoint ${weldPath.length} — ${weldPath.length>=2?fmtLen(pathLength(weldPath)):'click to add more'}`);
+    }
     else { const w=markerToWorld({x:bx,y:by,z:bz}); document.getElementById('sSel').textContent=fmtAxis(w[0])+'  '+fmtAxis(w[1])+'  '+fmtAxis(w[2]); }
     draw();
   }
@@ -1064,8 +1173,37 @@ function switchMode(mode) {
 // ══════════════════════════════════════════════════════════════
 function startPicking(which) {
   pickingMode=which; updatePickingUI();
+  document.getElementById('drawBtns').style.display='none';
   wrap.classList.remove('pick-start','pick-end');
   wrap.classList.add('pick-'+which); draw();
+}
+
+// ── Draw Path mode: click a sequence of waypoints on the cloud ──
+function startDrawPath(){
+  if(!loaded||!ptsBuf){toast('Load a reconstruction first');return;}
+  weldPath=[]; weldStart=weldEnd=null; stopPlay(); playT=0;
+  pickingMode='draw'; updatePickingUI();
+  document.getElementById('drawBtns').style.display='';
+  wrap.classList.remove('pick-start','pick-end');
+  draw();
+}
+function undoDrawPoint(){
+  if(pickingMode!=='draw'||!weldPath||!weldPath.length)return;
+  weldPath.pop();
+  weldEnd = weldPath.length ? weldPath[weldPath.length-1] : null;
+  if(!weldPath.length) weldStart=null;
+  updatePickingUI(); draw();
+}
+function finishDrawPath(){
+  if(pickingMode!=='draw')return;
+  if(!weldPath||weldPath.length<2){toast('Click at least 2 waypoints first');return;}
+  weldStart=weldPath[0]; weldEnd=weldPath[weldPath.length-1];
+  pickingMode=null; updatePickingUI();
+  document.getElementById('drawBtns').style.display='none';
+  setPointDisplay('start',weldStart);
+  setPointDisplay('end',  weldEnd);
+  updateWeldCoords(); draw();
+  toast(`Path drawn: ${weldPath.length} waypoints, ${fmtLen(pathLength(weldPath))}`);
 }
 function updatePickingUI(){
   const badge=document.getElementById('pickBadge');
@@ -1080,6 +1218,12 @@ function updatePickingUI(){
     badge.textContent='🔵 Click a point — set END'; badge.style.color='var(--blue)';
     overlay.innerHTML='<span style="color:var(--blue);font-size:12px;background:rgba(0,0,0,.6);padding:4px 12px;border-radius:4px">Picking end</span>';
     hMode.textContent='Pick End'; chH.className='chH end'; chV.className='chV end';
+  } else if (pickingMode==='draw'){
+    const n = weldPath ? weldPath.length : 0;
+    badge.textContent=`✏ Drawing path — ${n} waypoint${n===1?'':'s'} (click to add, Finish when done)`;
+    badge.style.color='var(--orange)';
+    overlay.innerHTML='<span style="color:var(--orange);font-size:12px;background:rgba(0,0,0,.6);padding:4px 12px;border-radius:4px">Drawing weld path — click waypoints in order</span>';
+    hMode.textContent='Draw Path'; chH.className='chH'; chV.className='chV';
   } else {
     badge.textContent='Click "Set Start" then click a point on the cloud.'; badge.style.color='var(--muted)';
     overlay.innerHTML=''; hMode.textContent='View';
@@ -1095,6 +1239,7 @@ function setPointDisplay(which,coord){
 }
 function clearPoint(which){
   if(which==='start')weldStart=null;else weldEnd=null;
+  weldPath=null;
   const el=document.getElementById(which+'Coords');
   const row=document.getElementById(which+'Row');
   el.textContent=(which==='start'?'Start':'End')+' not set';
@@ -1102,7 +1247,8 @@ function clearPoint(which){
   updateWeldCoords(); draw();
 }
 function clearAllPoints(){
-  weldStart=null;weldEnd=null;stopPlay();playT=0;
+  weldStart=null;weldEnd=null;weldPath=null;stopPlay();playT=0;
+  if(pickingMode==='draw'){pickingMode=null;updatePickingUI();document.getElementById('drawBtns').style.display='none';}
   ['start','end'].forEach(w=>{
     document.getElementById(w+'Coords').textContent=(w==='start'?'Start':'End')+' not set';
     document.getElementById(w+'Coords').classList.add('empty');
@@ -1124,69 +1270,36 @@ function clearAllPoints(){
 // ══════════════════════════════════════════════════════════════
 // Auto-detect (browser-side PCA on PLY color)
 // ══════════════════════════════════════════════════════════════
-function autoDetect(){
-  if (!loaded||!ptsBuf){toast('Load a .ply file first');return;}
-  const warmThresh=+document.getElementById('warmThresh').value;
-  const brightMin =+document.getElementById('brightMin').value;
-  const trimPct   =+document.getElementById('trimPct').value/100;
-
-  const cands=[];
-  for(let i=0;i<ptsBuf.length;i+=6){
-    const x=ptsBuf[i],y=ptsBuf[i+1],z=ptsBuf[i+2];
-    if(x===0&&y===0&&z===0)continue;
-    const r=ptsBuf[i+3],g=ptsBuf[i+4],b=ptsBuf[i+5];
-    if(r>b+warmThresh&&(r+g+b)/3>=brightMin) cands.push({x,y,z});
-  }
-  if(cands.length<10){toast('Not enough warm points — lower thresholds');return;}
-
-  const cx=cands.reduce((s,p)=>s+p.x,0)/cands.length;
-  const cy=cands.reduce((s,p)=>s+p.y,0)/cands.length;
-  const cz=cands.reduce((s,p)=>s+p.z,0)/cands.length;
-
-  let cxx=0,cxy=0,cxz=0,cyy=0,cyz=0,czz=0;
-  for(const p of cands){const dx=p.x-cx,dy=p.y-cy,dz=p.z-cz;cxx+=dx*dx;cxy+=dx*dy;cxz+=dx*dz;cyy+=dy*dy;cyz+=dy*dz;czz+=dz*dz;}
-  const n=cands.length;cxx/=n;cxy/=n;cxz/=n;cyy/=n;cyz/=n;czz/=n;
-
-  let ax=1,ay=0,az=0;
-  for(let it=0;it<50;it++){
-    const bx=cxx*ax+cxy*ay+cxz*az, by=cxy*ax+cyy*ay+cyz*az, bz=cxz*ax+cyz*ay+czz*az;
-    const len=Math.sqrt(bx*bx+by*by+bz*bz);
-    if(!len)break; ax=bx/len;ay=by/len;az=bz/len;
-  }
-
-  const projs=cands.map(p=>({p,t:(p.x-cx)*ax+(p.y-cy)*ay+(p.z-cz)*az}));
-  projs.sort((a,b)=>a.t-b.t);
-  const trim=Math.floor(projs.length*trimPct);
-  const trimmed=projs.slice(trim,projs.length-trim);
-  if(trimmed.length<4){toast('Too few points after trim');return;}
-
-  const sp=trimmed[0].p, ep=trimmed[trimmed.length-1].p;
-  const dx=ep.x-sp.x,dy=ep.y-sp.y,dz=ep.z-sp.z;
-  const seamLen=Math.sqrt(dx*dx+dy*dy+dz*dz);
-  const totalVar=cxx+cyy+czz;
-  const eigenVal=cxx*ax*ax+cyy*ay*ay+czz*az*az+2*(cxy*ax*ay+cxz*ax*az+cyz*ay*az);
-  const lin=totalVar>0?(eigenVal/totalVar*100).toFixed(0):0;
-
-  weldStart={x:sp.x,y:sp.y,z:sp.z};
-  weldEnd  ={x:ep.x,y:ep.y,z:ep.z};
-  setPointDisplay('start',weldStart);
-  setPointDisplay('end',  weldEnd);
-  updateWeldCoords(); draw();
-
-  const res=document.getElementById('detectResult');
-  res.classList.add('visible');
-  res.innerHTML=
-    `<span style="color:var(--green)">✓</span> <span class="hi">${cands.length.toLocaleString()}</span> seam pts &nbsp; Linearity <span class="acc">${lin}%</span><br>`+
-    `Length <span class="hi">${(seamLen*1000).toFixed(1)} mm</span><br>`+
-    `Start ${cm(sp.x)} ${cm(sp.y)} ${cm(sp.z)}<br>`+
-    `End &nbsp; ${cm(ep.x)} ${cm(ep.y)} ${cm(ep.z)}`;
-  document.getElementById('btnPlayAuto').style.display='';
-  toast(`Seam detected: ${(seamLen*1000).toFixed(1)} mm, ${lin}% linear`);
+async function loadPathDemo(kind) {
+  try {
+    const response = await fetch('/examples/' + kind + '.json');
+    if (!response.ok) throw new Error('Demo data unavailable');
+    const data = await response.json();
+    currentJobId = null;
+    ptsBuf = new Float32Array(data.points.flat());
+    onLoaded();
+    weldPath = data.path.map(p => ({x:p[0], y:-p[1], z:p[2]}));
+    weldStart = weldPath[0]; weldEnd = weldPath[weldPath.length-1];
+    currentResult = {weld_path:data.path};
+    setPointDisplay('start',weldStart); setPointDisplay('end',weldEnd);
+    updateWeldCoords(); fitView();
+    document.getElementById('resultCard').classList.add('visible');
+    document.getElementById('resultCard').textContent = 'Synthetic ' + kind + ' seam: graph-traced path. Use Play Weld to inspect traversal.';
+    setStatus('Synthetic demo');
+  } catch (err) { toast(err.message); }
 }
-['warmThresh','brightMin','trimPct'].forEach(id=>{
-  document.getElementById(id).addEventListener('input',e=>document.getElementById(id+'V').textContent=e.target.value);
-});
 
+async function autoDetect(){
+  if (!loaded || !ptsBuf) { toast('Load a point cloud first'); return; }
+  if (currentResult && currentResult.weld_path && currentResult.weld_path.length >= 2) {
+    weldPath = currentResult.weld_path.map(p => ({x:p[0],y:-p[1],z:p[2]}));
+    weldStart=weldPath[0]; weldEnd=weldPath[weldPath.length-1];
+    setPointDisplay('start',weldStart); setPointDisplay('end',weldEnd);
+    updateWeldCoords(); draw(); toast('Restored reconstructed path'); return;
+  }
+  toast('Use Draw Path to select the joint. Color alone cannot identify a weld.');
+  switchMode('manual');
+}
 // ══════════════════════════════════════════════════════════════
 // Coord output + export
 // ══════════════════════════════════════════════════════════════
@@ -1195,8 +1308,12 @@ function updateWeldCoords(){
   const ws = markerToWorld(weldStart);
   const we = markerToWorld(weldEnd);
   const dx = we[0]-ws[0], dy = we[1]-ws[1], dz = we[2]-ws[2];
-  const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
-  const nx = len>0?dx/len:0, ny = len>0?dy/len:0, nz = len>0?dz/len:0;
+  const chord = Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const nx = chord>0?dx/chord:0, ny = chord>0?dy/chord:0, nz = chord>0?dz/chord:0;
+  // Length = arc length along the waypoint path (equals the chord when straight).
+  const p = activePath();
+  const len = p ? pathLength(p) : chord;
+  const nWp = p ? p.length : 2;
   document.getElementById('sLen').textContent = fmtLen(len);
   document.getElementById('coordOutput').innerHTML=
     `<span class="lbl" style="color:var(--green)">START</span><br>`+
@@ -1212,10 +1329,11 @@ function updateWeldCoords(){
     `y: <span class="val">${ny.toFixed(4)}</span><br>`+
     `z: <span class="val">${nz.toFixed(4)}</span><br><br>`+
     `<span class="lbl">LENGTH</span> <span class="len">${fmtLen(len)}</span>`+
+    (nWp>2 ? ` <span style="color:var(--muted);font-size:10px">(arc, ${nWp} waypoints)</span>` : '')+
     (currentScaleSource ? `<br><span class="lbl" style="color:var(--muted);font-size:10px">scale: ${currentScaleSource}</span>` : '');
   document.getElementById('exportBtn').style.display='';
-  document.getElementById('rosBtn').style.display='';
-  document.getElementById('rosBtnArmed').style.display='';
+  document.getElementById('rosBtn').style.display='none';
+  document.getElementById('rosBtnArmed').style.display='none';
   document.getElementById('rosStatus').style.display='none';
 }
 
@@ -1224,14 +1342,19 @@ function exportJSON(){
   const ws = markerToWorld(weldStart);
   const we = markerToWorld(weldEnd);
   const dx = we[0]-ws[0], dy = we[1]-ws[1], dz = we[2]-ws[2];
-  const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
-  const units = currentScale === 1.0 ? 'vggt_units' : 'meters';
+  const chord = Math.sqrt(dx*dx+dy*dy+dz*dz);
+  const p = activePath();
+  const len = p ? pathLength(p) : chord;
+  const units = !currentScaleSource ? 'vggt_units' : 'meters';
   const data={weld_path:{
     start:{x:ws[0],y:ws[1],z:ws[2]},
     end:  {x:we[0],y:we[1],z:we[2]},
-    direction:{x:len>0?dx/len:0, y:len>0?dy/len:0, z:len>0?dz/len:0},
+    // Full ordered waypoint list (world axes, same units as start/end).
+    waypoints: (p||[weldStart,weldEnd]).map(pt=>{const w=markerToWorld(pt);return {x:w[0],y:w[1],z:w[2]};}),
+    is_curved: !!(p && p.length>2),
+    direction:{x:chord>0?dx/chord:0, y:chord>0?dy/chord:0, z:chord>0?dz/chord:0},
     length:+len.toFixed(6),
-    length_mm: currentScale === 1.0 ? null : +(len*1000).toFixed(3),
+    length_mm: !currentScaleSource ? null : +(len*1000).toFixed(3),
     units, scale_source: currentScaleSource,
   }, meta:{exported_at:new Date().toISOString(),source:'weld_path_planner'}};
   const a=document.createElement('a');
@@ -1244,7 +1367,7 @@ function exportJSON(){
 // Play animation
 // ══════════════════════════════════════════════════════════════
 function togglePlay(){
-  if(!weldStart||!weldEnd){toast('Set start and end first');return;}
+  if(!activePath()){toast('Set start and end first');return;}
   if(playing){stopPlay();return;}
   playing=true; if(playT>=1)playT=0;
   ['btnPlay','btnPlayAuto'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='⏹ Stop';});
@@ -1274,6 +1397,18 @@ function animPlay(){
 // ══════════════════════════════════════════════════════════════
 function toggleAxes(){showAxes=!showAxes;document.getElementById('btnAxes').classList.toggle('active',showAxes);draw();}
 function resetView(){cam={rotX:-0.55,rotY:0.0,zoom:1,panX:0,panY:0};draw();}
+function focusJoint(){
+  const path=activePath(); if(!path) {toast('Select a path first');return;}
+  cam.panX=0;cam.panY=0;cam.zoom=1;
+  let projected=path.map(p=>project(p.x,p.y,p.z));
+  const spanX=Math.max(...projected.map(p=>p.sx))-Math.min(...projected.map(p=>p.sx));
+  const spanY=Math.max(...projected.map(p=>p.sy))-Math.min(...projected.map(p=>p.sy));
+  cam.zoom=Math.min(12, .65*Math.min(canvas.width/Math.max(spanX,1),canvas.height/Math.max(spanY,1)));
+  projected=path.map(p=>project(p.x,p.y,p.z));
+  cam.panX=(canvas.width/2-(Math.max(...projected.map(p=>p.sx))+Math.min(...projected.map(p=>p.sx)))/2)/devicePixelRatio;
+  cam.panY=(canvas.height/2-(Math.max(...projected.map(p=>p.sy))+Math.min(...projected.map(p=>p.sy)))/2)/devicePixelRatio;
+  draw();
+}
 function fitView(){cam.zoom=1;cam.panX=0;cam.panY=0;cam.rotX=-0.55;cam.rotY=0.0;draw();}
 document.getElementById('ptSize').addEventListener('input',e=>{document.getElementById('ptSizeV').textContent=e.target.value;draw();});
 document.getElementById('opacity').addEventListener('input',e=>{document.getElementById('opacityV').textContent=e.target.value;draw();});
@@ -1283,16 +1418,55 @@ document.getElementById('opacity').addEventListener('input',e=>{document.getElem
 // ══════════════════════════════════════════════════════════════
 function cm(m)  { return (m*100).toFixed(2)+'cm'; }
 // Cloud-frame marker → world-axes display vector (un-flip Y, apply scale).
-// When currentScale === 1.0, the result is in raw VGGT units instead of metres.
+// When !currentScaleSource, the result is in raw VGGT units instead of metres.
 function markerToWorld(m) {
   return [m.x * currentScale, -m.y * currentScale, m.z * currentScale];
 }
+// Effective weld path: explicit waypoints, else the S→E pair.
+function activePath() {
+  if (weldPath && weldPath.length >= 2) return weldPath;
+  if (weldStart && weldEnd) return [weldStart, weldEnd];
+  return null;
+}
+// Arc length of a cloud-frame path, scaled like markerToWorld (metres, or
+// raw units when unscaled) so it feeds fmtLen directly.
+function pathLength(path) {
+  let L = 0;
+  for (let i = 1; i < path.length; i++) {
+    const dx = path[i].x - path[i-1].x, dy = path[i].y - path[i-1].y,
+          dz = path[i].z - path[i-1].z;
+    L += Math.sqrt(dx*dx + dy*dy + dz*dz);
+  }
+  return L * currentScale;
+}
+// Point at fraction t (0..1) of the path's ARC length (not per-segment lerp).
+function pathPointAt(path, t) {
+  let total = 0;
+  const seg = [];
+  for (let i = 1; i < path.length; i++) {
+    const dx = path[i].x - path[i-1].x, dy = path[i].y - path[i-1].y,
+          dz = path[i].z - path[i-1].z;
+    const l = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    seg.push(l); total += l;
+  }
+  if (total <= 0) return path[0];
+  let want = t * total;
+  for (let i = 0; i < seg.length; i++) {
+    if (want <= seg[i] || i === seg.length - 1) {
+      const f = seg[i] > 0 ? Math.min(want / seg[i], 1) : 0;
+      const a = path[i], b = path[i+1];
+      return { x: a.x + (b.x-a.x)*f, y: a.y + (b.y-a.y)*f, z: a.z + (b.z-a.z)*f };
+    }
+    want -= seg[i];
+  }
+  return path[path.length - 1];
+}
 // Cloud-frame point components (already in display order if cloud-frame).
 function fmtAxis(v) {
-  return currentScale === 1.0 ? v.toFixed(4)+'u' : (v*100).toFixed(2)+'cm';
+  return !currentScaleSource ? v.toFixed(4)+'u' : (v*100).toFixed(2)+'cm';
 }
 function fmtLen(v) {
-  return currentScale === 1.0 ? v.toFixed(4)+' u' : (v*1000).toFixed(1)+' mm';
+  return !currentScaleSource ? v.toFixed(4)+' u' : (v*1000).toFixed(1)+' mm';
 }
 function setStatus(s){ document.getElementById('hStatus').textContent=s; }
 let toastTO;
@@ -1309,7 +1483,7 @@ resize();
 // ══════════════════════════════════════════════════════════════
 async function sendToRobot(armed) {
   if (!weldStart || !weldEnd) { toast('Set start and end first'); return; }
-  if (currentScale === 1.0) {
+  if (!currentScaleSource) {
     toast('No metric scale — refusing to send unscaled coords to robot');
     return;
   }
@@ -1357,6 +1531,15 @@ async function sendToRobot(armed) {
     statusEl.textContent = '✗ Could not reach server: ' + err.message;
     toast('ROS2 send failed: ' + err.message);
   }
+}
+const resumeJob = new URLSearchParams(location.search).get('job');
+if (resumeJob) {
+  fetch('/status/' + encodeURIComponent(resumeJob)).then(r => r.json()).then(data => {
+    if (data.status === 'done' && data.result) {
+      currentJobId = resumeJob;
+      onReconstructionDone(resumeJob, data.result);
+    } else toast('Saved job is unavailable or still running');
+  }).catch(err => toast(err.message));
 }
 </script>
 </body>

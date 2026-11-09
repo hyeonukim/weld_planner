@@ -1,0 +1,89 @@
+C:\Users\ERIC\Desktop\Projects\weld_planner\server.py:1244: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=(device == 'cuda'), dtype=dtype):
+C:\Users\ERIC\Desktop\Projects\weld_planner\vggt\models\vggt.py:65: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=False):
+Using cache found in C:\Users\ERIC/.cache\torch\hub\YvanYin_Metric3D_main
+C:\Users\ERIC\AppData\Local\Programs\Python\Python310\lib\site-packages\timm\models\layers\__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+C:\Users\ERIC\AppData\Local\Programs\Python\Python310\lib\site-packages\timm\models\registry.py:4: FutureWarning: Importing from timm.models.registry is deprecated, please import via timm.models
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.models", FutureWarning)
+xFormers not available
+xFormers not available
+xFormers not available
+xFormers not available
+[Metric3D] Loaded metric3d_vit_small from torch.hub
+event: progress
+data: {"step": 1, "total": 7, "msg": "Running on CUDA"}
+
+
+event: progress
+data: {"step": 2, "total": 7, "msg": "Loading VGGT-1B\u2026"}
+
+
+event: progress
+data: {"step": 3, "total": 7, "msg": "Metric3D: deferred (loads only if needed)"}
+
+
+event: progress
+data: {"step": 4, "total": 7, "msg": "Running VGGT 3-D reconstruction\u2026"}
+
+
+event: progress
+data: {"step": 4, "total": 7, "msg": "Cropped scene to table footprint: 659,254 pts kept"}
+
+
+event: progress
+data: {"step": 4, "total": 7, "msg": "Detecting 50 mm fixture holes for scale\u2026"}
+
+
+event: progress
+data: {"step": 4, "total": 7, "msg": "Holes per view: [36, 36, 66] \u2192 scale 0.5578 m/unit"}
+
+
+event: progress
+data: {"step": 5, "total": 7, "msg": "Writing point cloud\u2026"}
+
+
+event: progress
+data: {"step": 5, "total": 7, "msg": "Point cloud: 164,814 pts (raw 804,972 \u2192 conf 804,685 \u2192 164,814)"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Segmenting workpiece (table-plane RANSAC)\u2026"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Dropped 178 low-prominence pts (rust/noise bumps)"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Workpiece: 29,031 pts (scene diag 1.746)"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Geometric seam (contact trace / plane intersection / ridge)\u2026"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Loading Metric3D (small)\u2026"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Metric3D scale 1/3\u2026"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Metric3D scale 2/3\u2026"}
+
+
+event: progress
+data: {"step": 6, "total": 7, "msg": "Metric3D scale 3/3\u2026"}
+
+
+event: progress
+data: {"step": 7, "total": 7, "msg": "Done \u2014 seam 344.4 mm"}
+
+
+straight-joint:contact-trace,open,band=2675,p1=15382,dev90=0.0034,wp=2
+Waypoints: 2; length (mm): 344.4335038912363
+Preview with: python preview_saved.py "tjoint_output"

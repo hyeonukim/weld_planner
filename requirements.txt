@@ -16,3 +16,4 @@ timm
 # Web server
 flask
 flask-cors
+scipy
